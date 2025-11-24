@@ -92,7 +92,7 @@ The code is released under the **Apache 2.0 License**; see `LICENSE`.
 ## Authorship and Contact
 | Name                  | Role            | E-mail                        | Phone               |
 |-----------------------|-----------------|------------------------------|---------------------|
-| Marcus Schlieper      | Maintainer      | mschlieper@ylook.de           | +49 2338 8748862    |
+| Marcus Schlieper      | Maintainer      | mschlieper@expchat.ai          | +49 2338 8748862    |
 | ExpChat.ai, Breckerfeld | Project host   | see above                    | +49 151 15751864    |
 
 ---
@@ -100,7 +100,7 @@ The code is released under the **Apache 2.0 License**; see `LICENSE`.
 ## Citation
 If you use this implementation in academic publications, please cite:
 
-&gt; Schlieper, M. (2025). *Temporal Transformer Rust: A time-aware, memory-efficient transformer implementation in pure Rust* (Version 0.0.1) \[Software\]. GitHub. https://github.com/YourAccount/temporal-transformer-rust
+&gt; Schlieper, M. (2025). *Temporal Transformer Rust: A time-aware, memory-efficient transformer implementation in pure Rust* (Version 0.0.1) \[Software\]. GitHub. git clone https://github.com/mhoellerschlieper/GPT.git
 
 ---
 
