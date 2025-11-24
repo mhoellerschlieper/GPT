@@ -1,0 +1,401 @@
+e r
+e n
+:  
+s t
+a n
+/ s
+< /s
+> </s>
+</s ></s>
+s s
+. </s></s>
+i st
+e  
+  A
+an t
+ist ant
+ A ss
+ Ass istant
+ Assistant : 
+s er
+ser : 
+en  
+U ser: 
+c h
+?  Assistant: 
+n d
+User:  W
+t  
+s  
+nd  
+i e 
+e l
+i n
+a s 
+en .</s></s>
+o n
+Ã ¤
+u nd 
+User: W ie 
+  W
+User: W as 
+Ã ¼
+e i
+er  
+ist  
+.  
+Ã 
+a ss
+i ch
+er n
+u t
+m  
+e h
+er .</s></s>
+r a
+l i
+e .</s></s>
+i nd 
+a r
+e ? Assistant: 
+Ã ¶
+e g
+a l
+a t
+S ch
+u n
+l e
+t .</s></s>
+in  
+an  
+? </s></s>
+c k
+s ch
+r o
+  und 
+a h
+i g
+!  Assistant: 
+d ie 
+User: Was  ist 
+u r
+,  
+W ass
+b e
+en ? Assistant: 
+s ind 
+el l
+a u
+i r
+r e
+an d
+!  W
+m an 
+eg en 
+m a
+e t
+in g
+t r
+er ? Assistant: 
+m p
+i er
+l an
+ch t 
+f  
+i el
+m m
+r Ã¶
+en . 
+h e
+w er
+i m 
+o r
+u m 
+o l
+t en 
+i l
+0 0
+ern  
+be w
+al l
+? Assistant:  M
+i on
+l Ã¼
+u ch
+n  
+li e
+G ut
+ich t
+ich  
+h l
+ier en 
+b ra
+u ck
+W i
+a s
+o u
+rÃ¶ Ã
+v iel
+en ?</s></s>
+J ah
+u nd
+i t 
+User:  H
+en t
+o d
+d en 
+er g
+n t
+k an
+e s
+d as 
+User:  G
+y ou
+S t
+ W ass
+Ã¤ l
+d a
+t  man 
+g ut
+lan z
+Ã¤ d
+Wass er 
+m it 
+er  A
+! Assistant:  Gut
+M o
+t ion
+r Ã¼
+od  
+t er.</s></s>
+ie  kan
+en  L
+eh t 
+b il
+le k
+h el
+m e 
+t e
+lie Ã
+er e 
+k en 
+  w
+ei Ã
+n  ich 
+! Assistant:  H
+st eh
+i t
+ie kan n ich 
+Ã¤l l
+e st
+st o
+k  
+F lÃ¼
+â 
+hel f
+f lanz
+en , 
+Jah r
+P flanz
+ut z
+! W ie kann ich 
+g e
+R egen 
+Ã¼ r
+ei ten 
+lek tr
+e u
+T e
+el  
+i mm
+ma cht 
+r d
+Ã¶ r
+v on
+t  und 
+helf en?</s></s>
+ent steh
+on n
+rÃ¶Ã t
+o t
+User: G o
+Ã¤ nd
+f Ã¤ll
+E lektr
+E rd
+Ã¼ st
+User: Go od 
+W ind 
+Elektr on
+B li
+R eg
+! Wie kann ich  helfen?</s></s>
+n ell
+von  W
+Ã¤ t
+P l
+t h
+ A b
+Wi nd
+Ã¼r  
+da mp
+ern eu
+User: Wie  viel
+t â
+icht ig
+M e
+at ur
+User: W ar
+P ro
+i ss
+bra uch
+un  
+00  
+T a
+User: Was  bew
+I ch
+ist  h
+ W Ã¼st
+e  sind 
+st  
+en  und 
+w ir
+on ig
+ge sch
+Ta g
+Wass er.</s></s>
+w ichtig
+mp er
+s ich
+e in 
+eh r
+re ss
+die  Erd
+u m
+a  
+Mo nd 
+en  in 
+b en 
+F rÃ¼
+und er
+u l
+au f 
+H onig
+el s
+es en.</s></s>
+f un
+? Assistant:  R
+a t 
+u p
+g en
+ Wass er
+eg t 
+a d
+e y
+! W as 
+Pflanz en 
+User: Wie  macht 
+fun k
+i k
+B erg
+das  I
+s  gut
+ing ! Assistant: Gut
+funk tion
+User: Wie  sind 
+e s 
+d u
+den  Z
+funktion ieren 
+Me er
+sto f
+mper atur
+en.  M
+le uch
+G e
+  k
+you  
+n utz
+Te mperatur
+o s
+Ã¤ u
+User: Was bew ir
+? Assistant: R und 
+s a
+a b
+s .</s></s>
+w Ã¤
+! </s></s>
+Regen  fÃ¤ll
+User: W h
+B l
+K o
+sch m
+G rÃ¶Ãt
+ra ch
+e  g
+e sind  h
+ehr ere 
+ra in
+ei te
+i b
+f en 
+k Ã¼
+en? Assistant:  S
+S and
+.  Ich
+b a
+au f
+r i
+s z
+f Ã¼r 
+en d
+t w
+el d
+el  f
+ar e 
+e in
+a k
+? Assistant:  E
+e  f
+Regen fÃ¤ll t 
+t un 
+damp f 
+User: Wie macht  man 
+User: Wie  funktionieren 
+. Ich  
+Ã¤d er? Assistant: 
+in k
+B ei
+r Ã¤der? Assistant: 
+t  b
+Sand  
+User: Was  tun 
+kÃ¼ hl
+an .</s></s>
+FlÃ¼ ss
+ch s
+in  WÃ¼st
+i en
+ut o
+W ol
+re ist 
+.  Assistant: 
+S p
+w imm
+tâ 
+un g
+ass e 
+f t.</s></s>
+Jahr .</s></s>
+Sp rach
+b r
+sich .</s></s>
+i s 
+o  
+d er A
+S ie 
+User: Was  sind 
+User: War um 
+Ã¤ r
+en  h

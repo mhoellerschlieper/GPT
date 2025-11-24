@@ -1,0 +1,23 @@
+// =============================================
+// lib.rs
+// =============================================
+pub mod adam;
+pub mod dataset_loader;
+pub mod embeddings;
+pub mod feed_forward;
+pub mod layer_norm;
+pub mod llm;
+pub mod output_projection;
+pub mod self_attention;
+pub mod transformer;
+pub mod tokenizer_bpe;
+
+// Re-export key structs for easier access
+pub use dataset_loader::{Dataset, DatasetType};
+pub use embeddings::Embeddings;
+pub use llm::{LLM, Layer};
+    
+// Constants
+pub const MAX_SEQ_LEN: usize = 80;
+pub const EMBEDDING_DIM: usize = 128;
+pub const HIDDEN_DIM: usize = 256;
