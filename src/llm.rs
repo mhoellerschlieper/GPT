@@ -56,7 +56,7 @@ use crate::{
     MAX_SEQ_LEN,
     adam::Adam,             // Optimierer
     embeddings::Embeddings, // Token- und Positions-Embeddings
-    output_projection::OutputProjection,
+    layer_output_projection::OutputProjection,
     tokenizer_bpe::Tokenizer, // integrierter Tokenizer
     transformer::TransformerBlock,
 };

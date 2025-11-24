@@ -8,7 +8,7 @@ use std::any::Any;
 
 
 use crate::{
-    feed_forward::FeedForward, layer_norm::LayerNorm, llm::Layer, self_attention::SelfAttention,
+    feed_forward::FeedForward, layer_norm::LayerNorm, llm::Layer, layer_self_attention::SelfAttention,
 };
 #[derive(Serialize, Deserialize, Encode, Decode)]
 pub struct TransformerBlock {

@@ -5,6 +5,8 @@
 // Historie: 22_11_2025  MS  Sliding-Window
 // ===========================================
 use crate::MAX_SEQ_LEN;
+use ndarray::{Array2, ArrayBase, DataMut, Ix2};
+use rand::{Rng, thread_rng};
 
 /// Zerteilt eine Sequenz in überlappende Chunks.
 /// Parameter

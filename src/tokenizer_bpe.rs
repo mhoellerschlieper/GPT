@@ -6,7 +6,7 @@
 // ============================================================================
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap},
     fs::{File, OpenOptions},
     io::{Read, Write},
 };

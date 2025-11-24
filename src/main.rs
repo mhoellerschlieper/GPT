@@ -15,7 +15,7 @@ use ::llm::{EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN};
 use dataset_loader::{Dataset, DatasetType};
 
 use crate::{
-    embeddings::Embeddings, llm::LLM, output_projection::OutputProjection,
+    embeddings::Embeddings, llm::LLM, layer_output_projection::OutputProjection,
     transformer::TransformerBlock,
 };
 
@@ -25,8 +25,8 @@ mod embeddings;
 mod feed_forward;
 mod layer_norm;
 mod llm;
-mod output_projection;
-mod self_attention;
+mod layer_output_projection;
+mod layer_self_attention;
 mod tokenizer_bpe;
 mod transformer;
 

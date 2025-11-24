@@ -7,8 +7,8 @@ pub mod embeddings;
 pub mod feed_forward;
 pub mod layer_norm;
 pub mod llm;
-pub mod output_projection;
-pub mod self_attention;
+pub mod layer_output_projection;
+pub mod layer_self_attention;
 pub mod transformer;
 pub mod tokenizer_bpe;
 
