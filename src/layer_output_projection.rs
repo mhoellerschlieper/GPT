@@ -1,5 +1,5 @@
 // ===========================================================================
-//  Datei:        output_projections.rs
+//  Datei:        layer_output_projections.rs
 //  Projekt:      Lightweight Language Model (LLM)
 //  Modul:        Output Projection Layer
 // ---------------------------------------------------------------------------
