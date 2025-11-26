@@ -1,1 +1,5 @@
 /target
+checkpoint.bin
+Cargo.lock
+/data/bpe_merges.txt
+/data/bpe_vocab.bin

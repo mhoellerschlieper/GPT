@@ -178,7 +178,7 @@ fn main() {
     korpus.extend(dataset.pretraining_data.clone());
     korpus.extend(dataset.chat_training_data.clone());
 
-    let tokenizer = prepare_tokenizer(&korpus, 500_000);
+    let tokenizer = prepare_tokenizer(&korpus, 50_000);
     let i_vocab_size = tokenizer.vocab_size();
 
     let embeddings = Embeddings::from_tokenizer(&tokenizer);

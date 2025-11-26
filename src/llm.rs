@@ -44,22 +44,19 @@
 //  Entwicklungsphase, sollte jedoch in produktiven Umgebungen um feinere
 //  Fehlerbehandlungen erweitert werden.
 // ===========================================================================
-use std::{any::Any, cmp::Ordering, fs::File, io::ErrorKind};
-
+use crate::config::EMBEDDING_DIM;
+use crate::config::HIDDEN_DIM;
+use crate::config::MAX_SEQ_LEN;
+use crate::tokenizer_bpe::Tokenizer;
+use crate::transformer_block_v2::TransformerBlockV2;
+use crate::{embeddings::Embeddings, layer_output_projection::OutputProjection};
 use anyhow::{Context, Result};
 use bincode::{config, decode_from_std_read, encode_into_std_write};
-use ndarray::{Array1, Array2, Axis};
-
-use crate::config::{EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN};
-
-use crate::{
-    
-    embeddings::Embeddings, // Token- und Positions-Embeddings
-    layer_output_projection::OutputProjection,
-    tokenizer_bpe::Tokenizer, // integrierter Tokenizer
-};
-use crate::transformer_block_v2::TransformerBlockV2;
-
+use ndarray::Array2;
+use ndarray::Axis;
+use std::cmp::Ordering;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 
 // ----------------------------- Layer-Trait ----------------------------------
 /**
@@ -374,34 +371,39 @@ impl LLM {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // --------------------------- Check-pointing -----------------------------
-    // ------------------------------------------------------------------------
-    /// Serialisiert Tokenizer + Layer-Stack (in derselben Reihenfolge) in eine
-    /// Binärdatei.  Die Funktion wirft bei I/O-Fehlern ein anyhow-`Result`.
-    pub fn save_checkpoint(&self, s_path: &str) -> Result<()> {
-        let mut f_file = File::create(s_path)
+    // Speichern (mit Cache-Clear und BufWriter)
+    pub fn save_checkpoint(&mut self, s_path: &str) -> Result<()> {
+        // 1) Attention-Caches leeren (kleinerer Checkpoint)
+        for layer in &mut self.network {
+            if let Some(block) = layer.as_any_mut().downcast_mut::<TransformerBlockV2>() {
+                block.attention.clear_cache();
+            }
+        }
+
+        // 2) Gepuffert schreiben
+        let f = File::create(s_path)
             .with_context(|| format!("Kann Datei {} nicht erstellen", s_path))?;
+        let mut w = BufWriter::with_capacity(8 * 1024 * 1024, f); // 8 MB
         let cfg = config::standard();
 
-        // 1) Tokenizer
-        encode_into_std_write(&self.tokenizer, &mut f_file, cfg)?;
+        // Hinweis: Tokenizer nicht mitspeichern (liegt separat in data/…)
+        // encode_into_std_write(&self.tokenizer, &mut w, cfg)?; // bewusst weggelassen
 
-        // 2) Layer iterativ serialisieren
+        // 3) Nur Layer-Gewichte serialisieren
         for layer in &self.network {
             let any = layer.as_any();
             if any.is::<Embeddings>() {
-                encode_into_std_write(any.downcast_ref::<Embeddings>().unwrap(), &mut f_file, cfg)?;
+                encode_into_std_write(any.downcast_ref::<Embeddings>().unwrap(), &mut w, cfg)?;
             } else if any.is::<TransformerBlockV2>() {
                 encode_into_std_write(
                     any.downcast_ref::<TransformerBlockV2>().unwrap(),
-                    &mut f_file,
+                    &mut w,
                     cfg,
                 )?;
             } else if any.is::<OutputProjection>() {
                 encode_into_std_write(
                     any.downcast_ref::<OutputProjection>().unwrap(),
-                    &mut f_file,
+                    &mut w,
                     cfg,
                 )?;
             } else {
@@ -409,6 +411,7 @@ impl LLM {
             }
         }
 
+        w.flush().ok(); // sauber flushen
         Ok(())
     }
 
@@ -416,36 +419,43 @@ impl LLM {
     /// Modell untrainiert, andernfalls werden die gespeicherten Gewichte
     /// vollständig wiederhergestellt.
     pub fn load_checkpoint(&mut self, s_path: &str) -> Result<()> {
-        let mut f_file = match File::open(s_path) {
+        use std::io::ErrorKind;
+
+        let f = match File::open(s_path) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 eprintln!("Checkpoint {} nicht gefunden, untrainiertes Modell", s_path);
                 return Ok(());
             }
-            Err(e) => {
-                return Err(e).context("Fehler beim Öffnen des Checkpoints");
-            }
+            Err(e) => return Err(e).context("Fehler beim Öffnen des Checkpoints"),
         };
+
+        let mut r = BufReader::with_capacity(8 * 1024 * 1024, f); // 8 MB
         let cfg = config::standard();
 
-        // 1) Tokenizer
-        self.tokenizer = decode_from_std_read(&mut f_file, cfg)
-            .context("Fehler beim Deserialisieren des Tokenizers")?;
+        // Hinweis: Tokenizer wird hier nicht gelesen (liegt separat in data/…)
+        // self.tokenizer = decode_from_std_read(&mut r, cfg)
+        //     .context("Fehler beim Deserialisieren des Tokenizers")?;
 
-        // 2) Layer
         for layer in &mut self.network {
             let any = layer.as_any_mut();
             if any.is::<Embeddings>() {
-                *any.downcast_mut::<Embeddings>().unwrap() =
-                    decode_from_std_read(&mut f_file, cfg)?;
+                *any.downcast_mut::<Embeddings>().unwrap() = decode_from_std_read(&mut r, cfg)?;
             } else if any.is::<TransformerBlockV2>() {
                 *any.downcast_mut::<TransformerBlockV2>().unwrap() =
-                    decode_from_std_read(&mut f_file, cfg)?;
+                    decode_from_std_read(&mut r, cfg)?;
             } else if any.is::<OutputProjection>() {
                 *any.downcast_mut::<OutputProjection>().unwrap() =
-                    decode_from_std_read(&mut f_file, cfg)?;
+                    decode_from_std_read(&mut r, cfg)?;
             } else {
                 unreachable!("unbekannter Layer-Typ beim Laden");
+            }
+        }
+
+        // Nach dem Laden: Attention-Caches leeren, damit sie frisch sind
+        for layer in &mut self.network {
+            if let Some(block) = layer.as_any_mut().downcast_mut::<TransformerBlockV2>() {
+                block.attention.clear_cache();
             }
         }
 
