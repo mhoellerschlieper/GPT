@@ -1,12 +1,13 @@
 // ============================================================================
-//  Datei       : tokenizer_bpe.rs – Konsolidierte Fassung
+//  Datei       : tokenizer_bpe.rs – Konsolidierte Fassung (Fix)
 //  Autor       : Marcus Schlieper (ExpChat.ai)
 //  Erstellt    : 23.11.2025
 //  Zweck       : Byte-Level-BPE-Tokenizer mit integriertem Vokabular
+//  Änderungen  : 26.11.2025  MS  Fix: Special-Tokens, Typen, save/load, eos_id()
 // ============================================================================
 
 use std::{
-    collections::{HashMap},
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{Read, Write},
 };
@@ -25,16 +26,12 @@ const S_UNK: &str = "<unk>";
 // ---------------------------------------------------------------------------
 #[derive(Clone, Debug, Serialize, Deserialize, Encode, Decode)]
 pub struct Tokenizer {
-    /* -----------------------------------------------------------
-     *  Vokabular (ehemals struct Vocab)
-     * --------------------------------------------------------- */
-    #[bincode(with_serde)] pub(crate) encode: HashMap<String, usize>,
-    #[bincode(with_serde)] pub(crate) decode: HashMap<usize, String>,
-    #[bincode(with_serde)] pub(crate) words : Vec<String>,
+    // Vokabular
+    #[bincode(with_serde)] pub(crate) encode: HashMap<String, usize>, // token -> id
+    #[bincode(with_serde)] pub(crate) decode: HashMap<usize, String>, // id -> token
+    #[bincode(with_serde)] pub(crate) words : Vec<String>,            // id-Index = Position
 
-    /* -----------------------------------------------------------
-     *  BPE-Merges
-     * --------------------------------------------------------- */
+    // BPE-Merges
     merges      : Vec<(String, String)>,
     fast_lookup : HashMap<(String, String), String>, // (l,r) → "lr"
 }
@@ -46,12 +43,14 @@ impl Tokenizer {
     // -------- Konstruktion --------------------------------------------------
     /// Erstellt einen reinen Byte-Level-Tokenizer (256 Zeichen + UNK + EOS).
     pub fn new_byte_level() -> Self {
-        let mut encode = HashMap::with_capacity(258);
-        let mut decode = HashMap::with_capacity(258);
-        let mut words  = Vec::with_capacity(258);
+        let mut encode: HashMap<String, usize> = HashMap::with_capacity(258);
+        let mut decode: HashMap<usize, String> = HashMap::with_capacity(258);
+        let mut words:  Vec<String>            = Vec::with_capacity(258);
 
+        // 0..=255: einzelne Bytes als 1-Char-Strings
         for byte in 0u8..=255 {
-            let tok = (byte as char).to_string();
+            let ch  = char::from(byte);
+            let tok = ch.to_string();
             let id  = byte as usize;
             encode.insert(tok.clone(), id);
             decode.insert(id, tok.clone());
@@ -62,6 +61,7 @@ impl Tokenizer {
         encode.insert(S_UNK.to_string(), id_unk);
         decode.insert(id_unk, S_UNK.to_string());
         words.push(S_UNK.to_string());
+
         // EOS
         let id_eos = words.len();
         encode.insert(S_EOS.to_string(), id_eos);
@@ -88,6 +88,14 @@ impl Tokenizer {
         self.decode.get(&id)
     }
 
+    pub fn eos_id(&self) -> usize {
+        self.encode_token(S_EOS).expect("EOS-Token fehlt im Vokabular")
+    }
+
+    pub fn unk_id(&self) -> usize {
+        self.encode_token(S_UNK).expect("UNK-Token fehlt im Vokabular")
+    }
+
     /// Fügt bei BPE-Training einen neuen Merge-Token hinzu.
     fn add_merge_token(&mut self, token: &str) -> usize {
         if let Some(id) = self.encode_token(token) { return id; }
@@ -104,7 +112,7 @@ impl Tokenizer {
         let mut corpus: Vec<Vec<String>> = texts.iter()
             .map(|s| {
                 let mut v: Vec<String> =
-                    s.bytes().map(|b| (b as char).to_string()).collect();
+                    s.bytes().map(|b| char::from(b).to_string()).collect();
                 v.push(S_EOS.to_string());
                 v
             })
@@ -150,12 +158,15 @@ impl Tokenizer {
     pub fn encode_text(&self, text: &str) -> Vec<usize> {
         // Byte-Level-Tokenisierung
         let mut tokens: Vec<String> =
-            text.bytes().map(|b| (b as char).to_string()).collect();
+            text.bytes().map(|b| char::from(b).to_string()).collect();
         tokens.push(S_EOS.to_string());
-        // Greedy-BPE
+
+        // Greedy-BPE: Merge-Liste in Reihenfolge anwenden
         for (l, r) in &self.merges {
-            let key = (l.clone(), r.clone());
-            let merged = &self.fast_lookup[&key];
+            let merged = self
+                .fast_lookup
+                .get(&(l.clone(), r.clone()))
+                .expect("Merge-Lookup fehlt");
             let mut i = 0usize;
             while i + 1 < tokens.len() {
                 if &tokens[i] == l && &tokens[i + 1] == r {
@@ -166,8 +177,9 @@ impl Tokenizer {
                 }
             }
         }
+
         // Mapping Token → ID (OOV → UNK)
-        let unk_id = self.encode_token(S_UNK).expect("UNK fehlt");
+        let unk_id = self.unk_id();
         tokens
             .iter()
             .map(|t| self.encode_token(t).unwrap_or(unk_id))
@@ -180,15 +192,23 @@ impl Tokenizer {
         for &id in ids {
             if let Some(tok) = self.decode_id(id) {
                 if tok == S_EOS { break; }
-                tok.chars().for_each(|c| bytes.push(c as u8));
+                if tok == S_UNK {
+                    // Unbekanntes Token: auslassen (oder b'?')
+                    continue;
+                }
+                for c in tok.chars() {
+                    // Byte-Ebene: die BPE-Merges bestehen aus Byte-Zeichen
+                    bytes.push(c as u8);
+                }
             }
         }
         String::from_utf8_lossy(&bytes).to_string()
     }
 
     // -------- Persistenz ----------------------------------------------------
+    // Hinweis: Beide Dateien werden BINÄR gespeichert (sicher gegen Trennzeichen).
     pub fn save(&self, p_vocab: &str, p_merges: &str) -> std::io::Result<()> {
-        /* Binär: words */
+        // Binär: words
         let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(p_vocab)?;
         f.write_all(&(self.words.len() as u64).to_le_bytes())?;
         for w in &self.words {
@@ -196,21 +216,29 @@ impl Tokenizer {
             f.write_all(&(bytes.len() as u32).to_le_bytes())?;
             f.write_all(bytes)?;
         }
-        /* Text: merges */
+
+        // Binär: merges (count, dann je Paar: len_l | l | len_r | r)
         let mut m = OpenOptions::new().create(true).write(true).truncate(true).open(p_merges)?;
+        m.write_all(&(self.merges.len() as u64).to_le_bytes())?;
         for (l, r) in &self.merges {
-            writeln!(m, "{l} {r}")?;
+            let bl = l.as_bytes();
+            let br = r.as_bytes();
+            m.write_all(&(bl.len() as u32).to_le_bytes())?;
+            m.write_all(bl)?;
+            m.write_all(&(br.len() as u32).to_le_bytes())?;
+            m.write_all(br)?;
         }
         Ok(())
     }
 
     pub fn load(p_vocab: &str, p_merges: &str) -> std::io::Result<Self> {
-        /* Binär lesen */
+        // Binär lesen: vocab/words
         let mut f = File::open(p_vocab)?;
         let mut buf64 = [0u8; 8];
         f.read_exact(&mut buf64)?;
         let count = u64::from_le_bytes(buf64) as usize;
-        let mut words = Vec::with_capacity(count);
+
+        let mut words: Vec<String> = Vec::with_capacity(count);
         for _ in 0..count {
             let mut len_buf = [0u8; 4];
             f.read_exact(&mut len_buf)?;
@@ -220,23 +248,43 @@ impl Tokenizer {
             words.push(String::from_utf8(data)
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "UTF-8"))?);
         }
-        let mut encode = HashMap::with_capacity(words.len());
-        let mut decode = HashMap::with_capacity(words.len());
+
+        let mut encode: HashMap<String, usize> = HashMap::with_capacity(words.len());
+        let mut decode: HashMap<usize, String> = HashMap::with_capacity(words.len());
         for (id, tok) in words.iter().enumerate() {
             encode.insert(tok.clone(), id);
             decode.insert(id, tok.clone());
         }
 
-        /* Merges lesen */
-        let txt = std::fs::read_to_string(p_merges)?;
-        let mut merges = Vec::new();
-        let mut fast  = HashMap::new();
-        for ln in txt.lines() {
-            if let Some((l, r)) = ln.split_once(' ') {
-                merges.push((l.to_string(), r.to_string()));
-                fast.insert((l.to_string(), r.to_string()), format!("{l}{r}"));
-            }
+        // Binär lesen: merges
+        let mut merges_file = File::open(p_merges)?;
+        let mut cnt_buf = [0u8; 8];
+        merges_file.read_exact(&mut cnt_buf)?;
+        let merges_count = u64::from_le_bytes(cnt_buf) as usize;
+
+        let mut merges: Vec<(String, String)> = Vec::with_capacity(merges_count);
+        let mut fast: HashMap<(String, String), String> = HashMap::with_capacity(merges_count);
+
+        for _ in 0..merges_count {
+            let mut len_buf = [0u8; 4];
+            merges_file.read_exact(&mut len_buf)?;
+            let len_l = u32::from_le_bytes(len_buf) as usize;
+            let mut bl = vec![0u8; len_l];
+            merges_file.read_exact(&mut bl)?;
+            let l = String::from_utf8(bl)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "UTF-8 l"))?;
+
+            merges_file.read_exact(&mut len_buf)?;
+            let len_r = u32::from_le_bytes(len_buf) as usize;
+            let mut br = vec![0u8; len_r];
+            merges_file.read_exact(&mut br)?;
+            let r = String::from_utf8(br)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "UTF-8 r"))?;
+
+            fast.insert((l.clone(), r.clone()), format!("{l}{r}"));
+            merges.push((l, r));
         }
+
         Ok(Self { encode, decode, words, merges, fast_lookup: fast })
     }
 }
@@ -257,5 +305,12 @@ mod tests {
         let ids = tok.encode_text(sample);
         let decoded = tok.decode_tokens(&ids);
         assert_eq!(decoded, sample);
+    }
+
+    #[test]
+    fn eos_unk_ids_exist() {
+        let tok = Tokenizer::new_byte_level();
+        assert!(tok.eos_id() < tok.vocab_size());
+        assert!(tok.unk_id() < tok.vocab_size());
     }
 }

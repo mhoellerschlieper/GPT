@@ -37,11 +37,12 @@ use std::any::Any;
 //  Abhaengigkeiten innerhalb des Projektes
 // ---------------------------------------------------------------------------
 use crate::{
-    EMBEDDING_DIM,
-    MAX_SEQ_LEN,
     adam::Adam,
     llm::Layer,
+    config::MAX_SEQ_LEN,
+    config::EMBEDDING_DIM
 };
+
 use crate::tokenizer_bpe::Tokenizer;
 
 // ---------------------------------------------------------------------------

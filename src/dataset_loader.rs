@@ -79,7 +79,7 @@ pub fn get_data_from_csv(path: String) -> Vec<String> {
     let mut v_data: Vec<String> = Vec::new();
 
     // Über alle Datensätze iterieren
-    for (HIDDEN_DIM, result) in rdr.records().enumerate() {
+    for (_HIDDEN_DIM, result) in rdr.records().enumerate() {
         let record = result.expect("Fehler beim Lesen eines CSV-Datensatzes");
 
         // Spalten zu einer einzelnen Zeile zusammenfügen

@@ -8,8 +8,8 @@ use rand_distr::{Distribution, Normal};
 use bincode::{Encode, Decode};
 use serde   ::{Serialize, Deserialize};
 
-
-use crate::{EMBEDDING_DIM, adam::Adam, llm::Layer};
+use crate::config::{EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN};
+use crate::{adam::Adam, llm::Layer};
 
 #[derive(Serialize, Deserialize, Encode, Decode)]
 pub struct SelfAttention {

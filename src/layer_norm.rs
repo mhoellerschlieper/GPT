@@ -3,31 +3,12 @@
 //  Projekt:      Lightweight Language Model (LLM)
 //  Modul:        Layer Normalisation
 // ---------------------------------------------------------------------------
-//  Beschreibung:
-//      Dieses Modul stellt eine vollständig differenzierbare Implementierung
-//      der Layer-Normalisierung (LayerNorm) inklusive lernbarer Skalierungs-
-//      (γ) und Verschiebungsparameter (β) bereit. Die Schicht normalisiert
-//      jede Eingabezeile (Token-Vektor) auf Mittelwert = 0 und Varianz = 1,
-//      bevor eine affine Transformation erfolgt.  Die Realisierung
-//      unterstützt Vorwärts- und Rückwärtsdurchlauf und fügt sich über das
-//      Trait `Layer` nahtlos in den gesamten Modellgraphen ein.  Die
-//      Parameteraktualisierung wird durch einen Adam-Optimierer vorgenommen.
-// ---------------------------------------------------------------------------
 //  Autor:        Marcus Schlieper
-//  Organisation: ExpChat.ai – Der KI-Chat-Client für den Mittelstand aus
-//                Breckerfeld im Sauerland
-//  Kontakt:      Tel  : +49 2338 8748862
-//                Mobil: +49 151 1575 1864
-//                Mail : mschlieper@ylook.de
-//  Adresse:      Epscheider Str. 21, 58339 Breckerfeld, Deutschland
+//  Organisation: ExpChat.ai – Der KI-Chat-Client für den Mittelstand
 //  Historie:
-//      2025-11-23  Erstfassung erstellt und umfassend dokumentiert.
-// ---------------------------------------------------------------------------
-//  Sicherheitshinweis:
-//      Laufzeitfehler (z. B. Division durch Null) werden durch einen
-//      stabilen Epsilon-Wert verhindert.  Panics treten ausschließlich bei
-//      inkorrekter interner Nutzung (fehlender Forward-Aufruf) auf und
-//      deuten auf einen Programmierfehler hin.
+//      2025-11-23  Erstfassung
+//      2025-11-26  Numerik-Fix (sqrt(var+eps)), saubere Backward-Formel,
+//                  Caches für bincode/serde skip, Typspezifizierung f32
 // ===========================================================================
 
 use ndarray::{Array2, Axis};
@@ -40,25 +21,36 @@ use crate::{adam::Adam, llm::Layer};
 /// Layer-Normalisierung mit lernbaren Parametern.
 #[derive(Serialize, Deserialize, Encode, Decode)]
 pub struct LayerNorm {
-    /// Numerischer Stabilisator zur Vermeidung von Division-durch-Null.
     epsilon: f32,
 
-    // ----------------------------- Parameter ------------------------------
-    /// Skalierungsfaktor γ Form: [1, embedding_dim]
-   #[bincode(with_serde)] gamma: Array2<f32>,
-    /// Verschiebung β Form: [1, embedding_dim]
-   #[bincode(with_serde)] beta:  Array2<f32>,
+    // Lernbare Parameter
+    #[bincode(with_serde)]
+    gamma: Array2<f32>,
+    #[bincode(with_serde)]
+    beta:  Array2<f32>,
 
+    // Caches: nur Laufzeit, nicht serialisieren
+    #[serde(skip)]
+    #[bincode(with_serde)]
+    cached_input: Option<Array2<f32>>,
 
-    // --------------------------- Zwischenspeicher -------------------------
-    /// Eingangstensor des Forward-Passes (nur Laufzeit)
-    #[serde(skip)]#[bincode(with_serde)]  cached_input: Option<Array2<f32>>,
-    /// Mittelwert pro Tokenzeile (nur Laufzeit)
-  #[serde(skip)]#[bincode(with_serde)]  cached_mean:  Option<Array2<f32>>,
-    /// Standardabweichung pro Tokenzeile (nur Laufzeit)
-  #[serde(skip)]#[bincode(with_serde)]  cached_std:   Option<Array2<f32>>,
+    #[serde(skip)]
+    #[bincode(with_serde)]
+    cached_mean:  Option<Array2<f32>>,
 
-    // ----------------------------- Optimierer -----------------------------
+    #[serde(skip)]
+    #[bincode(with_serde)]
+    cached_std:   Option<Array2<f32>>,
+
+    #[serde(skip)]
+    #[bincode(with_serde)]
+    cached_denom:   Option<Array2<f32>>,
+
+    #[serde(skip)]
+    #[bincode(with_serde)]
+    cached_x_hat:   Option<Array2<f32>>,
+
+    // Optimierer
     #[bincode(with_serde)]
     optimizer_gamma: Adam,
     #[bincode(with_serde)]
@@ -70,8 +62,6 @@ pub struct LayerNorm {
 // ---------------------------------------------------------------------------
 impl LayerNorm {
     /// Erzeugt eine LayerNorm-Instanz mit γ = 1, β = 0.
-    ///
-    /// * `embedding_dim` – Dimension der einzeln zu normalisierenden Vektoren.
     pub fn new(embedding_dim: usize) -> Self {
         LayerNorm {
             epsilon: 1e-5,
@@ -79,31 +69,42 @@ impl LayerNorm {
             beta:  Array2::zeros((1, embedding_dim)), // β initial = 0
             cached_input: None,
             cached_mean:  None,
-            cached_std:   None,
+            cached_std:  None,
+            cached_denom: None,
+            cached_x_hat: None,
             optimizer_gamma: Adam::new((1, embedding_dim)),
             optimizer_beta:  Adam::new((1, embedding_dim)),
         }
     }
 
-    /// Führt die eigentliche Normalisierung und anschließende affine
-    /// Transformation aus; Zwischenergebnisse werden für den Backward-Pass
-    /// zwischengespeichert.
+    /// Vorwärts: Normalisierung + affine Transformation.
+    /// Korrekt: denom = sqrt(var + epsilon)
     pub fn normalize(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        // Mittelwert und Standardabweichung über Achse 1 (Features je Token).
-        let mean = input.mean_axis(Axis(1))
-                        .expect("mean_axis schlug fehl")
-                        .insert_axis(Axis(1));
-        let std  = input.std_axis(Axis(1), 0.0)  // 0.0 = ddof
-                        .insert_axis(Axis(1));
+        // Mittelwert je Zeile (über Features)
+        let mean = input
+            .mean_axis(Axis(1))
+            .expect("mean_axis schlug fehl")
+            .insert_axis(Axis(1)); // [seq, 1]
 
-        // Zwischenspeicher für Rückwärtsrechnung
+        // Varianz je Zeile (über Features)
+        let var = input
+            .var_axis(Axis(1), 0.0) // ddof=0
+            .insert_axis(Axis(1)); // [seq, 1]
+
+        // denom = sqrt(var + eps)
+        let denom = (var.mapv(|v| v + self.epsilon)).mapv(|v| v.sqrt()); // [seq, 1]
+
+        // x_hat und Ausgabe
+        let x_hat = (input - &mean) / &denom;          // [seq, embed]
+        let out   = &self.gamma * &x_hat + &self.beta; // broadcast
+
+        // Caches
         self.cached_input = Some(input.clone());
-        self.cached_mean  = Some(mean.clone());
-        self.cached_std   = Some(std.clone());
+        self.cached_mean  = Some(mean);
+        self.cached_denom = Some(denom);
+        self.cached_x_hat = Some(x_hat);
 
-        // Normalisierung + affine Transformation
-        let normalized = (input - &mean) / (&std + self.epsilon);
-        &self.gamma * &normalized + &self.beta
+        out
     }
 }
 
@@ -116,71 +117,52 @@ impl Layer for LayerNorm {
     fn as_any(&self) -> &dyn Any       { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
-    // ----------------------------- Forward --------------------------------
-    /// Delegiert an `normalize`.
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         self.normalize(input)
     }
 
-    // ----------------------------- Backward -------------------------------
-    /// Führt vollständige Rückwärtsableitung inkl. Parameter-Updates durch.
-    ///
-    /// * `grads` – Eingehender Gradienten-Tensor gleicher Form wie `input`.
-    /// * `lr`    – Lernrate für den Adam-Optimierer.
-    ///
-    /// Rückgabewert: Gradienten-Tensor für vorgelagerte Schichten.
+    /// Stabiler Backward:
+    /// dx = (1/denom) * (dyγ - mean(dyγ) - x_hat * mean(dyγ * x_hat))
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        // ------------------ Zwischengrößen abrufen ------------------------
-        let input = self.cached_input
-                        .as_ref()
-                        .expect("forward muss vor backward aufgerufen werden");
-        let mean  = self.cached_mean
-                        .as_ref()
-                        .expect("mean nicht gesetzt");
-        let std   = self.cached_std
-                        .as_ref()
-                        .expect("std nicht gesetzt");
+        // Caches holen
+        let x      = self.cached_input.as_ref()
+            .expect("forward muss vor backward aufgerufen werden");
+        let mean   = self.cached_mean.as_ref().expect("mean nicht gesetzt");
+        let denom  = self.cached_denom.as_ref().expect("denom nicht gesetzt");
+        let x_hat  = self.cached_x_hat.as_ref().expect("x_hat nicht gesetzt");
 
-        // Vorab berechnete Normalisierung erneut herstellen
-        let normalized   = (input - mean) / (std + self.epsilon);
-        let n_features   = input.shape()[1] as f32;
+        let seq_len = x.shape()[0];
+        // let feat    = x.shape()[1] as f32;
+        debug_assert_eq!(grads.shape(), &[seq_len, self.gamma.shape()[1]]);
 
-        // 1) Gradienten bezüglich γ und β
-        let grad_gamma   = (&normalized * grads)
-                            .sum_axis(Axis(0))
-                            .insert_axis(Axis(0));
-        let grad_beta    = grads.sum_axis(Axis(0))
-                            .insert_axis(Axis(0));
+        // dgamma, dbeta (Summe über Zeilen)
+        let grad_gamma = (x_hat * grads).sum_axis(Axis(0)).insert_axis(Axis(0)); // [1, embed]
+        let grad_beta  = grads.sum_axis(Axis(0)).insert_axis(Axis(0));           // [1, embed]
 
-        // 2) Gradient w.r.t. normalisierte Werte
-        let grad_norm    = &self.gamma * grads;
+        // dyγ
+        let dy_gamma = grads * &self.gamma; // [seq, embed]
 
-        // 3) Vollständige Ableitung nach Eingang (vgl. Ba et al., 2016)
-        let variance     = std * std + self.epsilon;
-        let grad_var     = (&grad_norm * &normalized)
-                            .sum_axis(Axis(1))
-                            .insert_axis(Axis(1))
-                            * (-0.5)
-                            / variance.mapv(|x| x.sqrt() * x.sqrt());
-        let grad_mean    = grad_norm.sum_axis(Axis(1))
-                            .insert_axis(Axis(1)) * (-1.0)
-                            / (std + self.epsilon)
-                          + &grad_var * (input - mean)
-                            .sum_axis(Axis(1))
-                            .insert_axis(Axis(1)) * (-2.0) / n_features;
+        // Mittelwerte über Features (je Zeile -> [seq,1])
+        let mean_dy_gamma = dy_gamma.mean_axis(Axis(1))
+            .expect("mean_axis dyγ fehlgeschlagen")
+            .insert_axis(Axis(1)); // [seq,1]
 
-        let grad_input   =  grad_norm / (std + self.epsilon)
-                          + &grad_var * 2.0 * (input - mean) / n_features
-                          + &grad_mean / n_features;
+        let mean_dy_gamma_xhat = (dy_gamma.clone() * x_hat).mean_axis(Axis(1))
+            .expect("mean_axis dyγ*x_hat fehlgeschlagen")
+            .insert_axis(Axis(1)); // [seq,1]
 
-        // 4) Parameter-Update via Adam
+        // dx gemäß Standard-Formel
+        let dx = (dy_gamma
+                 - &mean_dy_gamma
+                 - x_hat * &mean_dy_gamma_xhat) / denom;
+
+        // Parameter-Update via Adam
         self.optimizer_gamma.step(&mut self.gamma, &grad_gamma, lr);
         self.optimizer_beta .step(&mut self.beta , &grad_beta , lr);
 
-        grad_input
+        dx
     }
 
-    /// Gesamtanzahl lernbarer Parameter (γ + β).
     fn parameters(&self) -> usize {
         self.gamma.len() + self.beta.len()
     }

@@ -50,16 +50,16 @@ use anyhow::{Context, Result};
 use bincode::{config, decode_from_std_read, encode_into_std_write};
 use ndarray::{Array1, Array2, Axis};
 
+use crate::config::{EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN};
+
 use crate::{
-    EMBEDDING_DIM, // Modell-Hyperparameter
-    HIDDEN_DIM,
-    MAX_SEQ_LEN,
-    adam::Adam,             // Optimierer
+    
     embeddings::Embeddings, // Token- und Positions-Embeddings
     layer_output_projection::OutputProjection,
     tokenizer_bpe::Tokenizer, // integrierter Tokenizer
-    transformer::TransformerBlock,
 };
+use crate::transformer_block_v2::TransformerBlockV2;
+
 
 // ----------------------------- Layer-Trait ----------------------------------
 /**
@@ -70,12 +70,12 @@ use crate::{
  */
 pub trait Layer {
     fn layer_type(&self) -> &str;
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32>;
-    fn backward(&mut self, grads: &Array2<f32>, d_lr: f32) -> Array2<f32>;
+    fn forward(&mut self, input: &ndarray::Array2<f32>) -> ndarray::Array2<f32>;
+    fn backward(&mut self, grads: &ndarray::Array2<f32>, d_lr: f32) -> ndarray::Array2<f32>;
     fn parameters(&self) -> usize;
 
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 // ------------------------------- LLM ----------------------------------------
@@ -122,13 +122,11 @@ fn chunk_sequence(v_tokens: &[usize], i_overlap: usize) -> Vec<Vec<usize>> {
     while i_start < v_tokens.len() {
         let i_end = usize::min(i_start + MAX_SEQ_LEN, v_tokens.len());
         v_chunks.push(v_tokens[i_start..i_end].to_vec());
-
         if i_end == v_tokens.len() {
             break;
         }
-        i_start = i_end.saturating_sub(i_overlap); // Überlappung
+        i_start = i_end.saturating_sub(i_overlap);
     }
-
     v_chunks
 }
 
@@ -155,7 +153,7 @@ impl LLM {
         self.network
             .iter()
             .map(|l| l.layer_type())
-            .collect::<Vec<&str>>()
+            .collect::<Vec<_>>()
             .join(", ")
     }
 
@@ -201,86 +199,52 @@ impl LLM {
     //
     // =======================================================================
     fn forward(&mut self, s_input: &str) -> Vec<usize> {
-        // -------------------------------------------------------------------
-        // 1) Prompt in Byte-Tokens umwandeln und in überlappende Fenster
-        //    zerlegen (20 % Überschneidung).
-        // -------------------------------------------------------------------
         let v_prompt_tokens: Vec<usize> = self.tokenizer.encode_text(s_input);
         let v_chunks: Vec<Vec<usize>> = chunk_sequence(&v_prompt_tokens, MAX_SEQ_LEN / 5);
 
-        // -------------------------------------------------------------------
-        // 2) Initialisierungen
-        // -------------------------------------------------------------------
         let mut v_output_global: Vec<usize> = Vec::new();
-        let i_eos: usize = *self
-            .tokenizer
-            .encode_text("</s>")
-            .first()
-            .expect("EOS-Token fehlt im Vokabular");
+        let i_eos: usize = self.tokenizer.eos_id(); // <-- stelle sicher, dass es diese API gibt
 
-        // -------------------------------------------------------------------
-        // 3) Fensterweise Verarbeitung
-        // -------------------------------------------------------------------
         for (i_chunk_idx, v_chunk) in v_chunks.iter().enumerate() {
-            //----------------------------------------------------------------
-            // 3a) Kontext: Prompt-Tokens des aktuellen Fensters
-            //----------------------------------------------------------------
             let mut v_context_tokens: Vec<usize> = v_chunk.clone();
-
-            //----------------------------------------------------------------
-            // 3b) Ergebnis-Puffer: beginnt leer → kein Echo
-            //----------------------------------------------------------------
             let mut v_generated_tokens: Vec<usize> = Vec::new();
 
-            //----------------------------------------------------------------
-            // 3c) Autoregressive Schleife
-            //----------------------------------------------------------------
             for _ in 0..(MAX_SEQ_LEN - v_context_tokens.len()) {
-                // Eingabetensor: [1, seq_len]
                 let a_input = ndarray::Array2::from_shape_vec(
                     (1, v_context_tokens.len()),
                     v_context_tokens.iter().map(|&id| id as f32).collect(),
                 )
-                .expect("Ungültige Tensor­form für Eingabe");
+                .expect("ungueltige Tensorform fuer Eingabe");
 
-                // Vorwärtsdurchlauf durch den Layer-Stack
                 let mut a_activ = a_input;
                 for layer in &mut self.network {
                     a_activ = layer.forward(&a_activ);
                 }
 
-                // Letzten Zeitschritt extrahieren
                 let i_last_row = a_activ.shape()[0] - 1;
                 let a_last = a_activ
                     .row(i_last_row)
                     .to_owned()
                     .insert_axis(ndarray::Axis(0));
-
-                // Wahrscheinlichkeiten + Greedy-Decoding
                 let a_probs = Self::softmax(&a_last);
+
                 let i_next: usize = Self::greedy_decode(&a_probs)
                     .last()
                     .copied()
                     .expect("leere Greedy-Decoding-Ausgabe");
 
-                // Abbruch­kriterien
                 if i_next == i_eos {
                     break;
                 }
 
-                // Token an Kontext und Ergebnis anhängen
                 v_context_tokens.push(i_next);
                 v_generated_tokens.push(i_next);
 
-                // Fenster voll?
                 if v_context_tokens.len() >= MAX_SEQ_LEN {
                     break;
                 }
             }
 
-            //----------------------------------------------------------------
-            // 3d) EOS-Duplikate zwischen überlappenden Fenstern verhindern
-            //----------------------------------------------------------------
             if i_chunk_idx + 1 < v_chunks.len() {
                 if let Some(&last) = v_generated_tokens.last() {
                     if last == i_eos {
@@ -288,16 +252,8 @@ impl LLM {
                     }
                 }
             }
-
-            //----------------------------------------------------------------
-            // 3e) Globale Ergebnisliste erweitern
-            //----------------------------------------------------------------
             v_output_global.extend_from_slice(&v_generated_tokens);
         }
-
-        // -------------------------------------------------------------------
-        // 4) Rückgabe
-        // -------------------------------------------------------------------
         v_output_global
     }
 
@@ -312,29 +268,27 @@ impl LLM {
         let v_tokenized: Vec<Vec<usize>> = v_texts
             .iter()
             .map(|s| self.tokenizer.encode_text(s))
-            .collect();
+            .collect::<Vec<_>>();
 
         for i_epoch in 0..i_epochs {
-            let mut d_total_loss = 0.0;
+            let mut d_total_loss = 0.0f32;
+            let mut i_steps: usize = 0;
 
             for v_sample in &v_tokenized {
                 let v_chunks = chunk_sequence(v_sample, MAX_SEQ_LEN / 5);
-
                 for v_chunk in v_chunks {
                     if v_chunk.len() < 2 {
-                        continue; // zu kurz für Target-Shift
+                        continue;
                     }
-
                     let v_input_ids = &v_chunk[..v_chunk.len() - 1];
                     let v_target_ids = &v_chunk[1..];
 
-                    // 1) Eingabetensor
-                    let a_ids: Array1<f32> =
-                        Array1::from_iter(v_input_ids.iter().map(|&id| id as f32));
-                    let mut a_input: Array2<f32> = Array2::zeros((1, v_input_ids.len()));
+                    let a_ids: ndarray::Array1<f32> =
+                        ndarray::Array1::from_iter(v_input_ids.iter().map(|&id| id as f32));
+                    let mut a_input: ndarray::Array2<f32> =
+                        ndarray::Array2::zeros((1, v_input_ids.len()));
                     a_input.row_mut(0).assign(&a_ids);
 
-                    // 2) Forward-Pass
                     let mut a_forward = a_input;
                     for layer in &mut self.network {
                         a_forward = layer.forward(&a_forward);
@@ -343,18 +297,20 @@ impl LLM {
                     let a_probs = Self::softmax(&a_forward);
                     d_total_loss += Self::cross_entropy_loss_step(&a_probs, v_target_ids);
 
-                    // 3) Gradienten
                     let mut a_grads = Self::compute_gradients_step(&a_probs, v_target_ids);
                     Self::clip_gradients(&mut a_grads, 5.0);
 
-                    // 4) Backward-Pass
                     for layer in self.network.iter_mut().rev() {
                         a_grads = layer.backward(&a_grads, d_lr);
                     }
+                    i_steps += 1;
                 }
             }
-
-            let d_avg_loss = d_total_loss / v_tokenized.len() as f32;
+            let d_avg_loss = if i_steps > 0 {
+                d_total_loss / (i_steps as f32)
+            } else {
+                0.0
+            };
             println!("Epoch {}  Loss {:.4}", i_epoch, d_avg_loss);
         }
     }
@@ -410,7 +366,7 @@ impl LLM {
     }
 
     /// Globales Gradient-Clipping (L2-Norm)
-    fn clip_gradients(a_grads: &mut Array2<f32>, d_max_norm: f32) {
+    fn clip_gradients(a_grads: &mut ndarray::Array2<f32>, d_max_norm: f32) {
         let d_norm: f32 = a_grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
         if d_norm > d_max_norm {
             let d_scale = d_max_norm / d_norm;
@@ -433,31 +389,26 @@ impl LLM {
 
         // 2) Layer iterativ serialisieren
         for layer in &self.network {
-            match layer.as_any() {
-                l if l.is::<Embeddings>() => {
-                    encode_into_std_write(
-                        l.downcast_ref::<Embeddings>().unwrap(),
-                        &mut f_file,
-                        cfg,
-                    )?;
-                }
-                l if l.is::<TransformerBlock>() => {
-                    encode_into_std_write(
-                        l.downcast_ref::<TransformerBlock>().unwrap(),
-                        &mut f_file,
-                        cfg,
-                    )?;
-                }
-                l if l.is::<OutputProjection>() => {
-                    encode_into_std_write(
-                        l.downcast_ref::<OutputProjection>().unwrap(),
-                        &mut f_file,
-                        cfg,
-                    )?;
-                }
-                _ => unreachable!("unbekannter Layer-Typ"),
+            let any = layer.as_any();
+            if any.is::<Embeddings>() {
+                encode_into_std_write(any.downcast_ref::<Embeddings>().unwrap(), &mut f_file, cfg)?;
+            } else if any.is::<TransformerBlockV2>() {
+                encode_into_std_write(
+                    any.downcast_ref::<TransformerBlockV2>().unwrap(),
+                    &mut f_file,
+                    cfg,
+                )?;
+            } else if any.is::<OutputProjection>() {
+                encode_into_std_write(
+                    any.downcast_ref::<OutputProjection>().unwrap(),
+                    &mut f_file,
+                    cfg,
+                )?;
+            } else {
+                unreachable!("unbekannter Layer-Typ");
             }
         }
+
         Ok(())
     }
 
@@ -483,22 +434,21 @@ impl LLM {
 
         // 2) Layer
         for layer in &mut self.network {
-            match layer.as_any_mut() {
-                l if l.is::<Embeddings>() => {
-                    *l.downcast_mut::<Embeddings>().unwrap() =
-                        decode_from_std_read(&mut f_file, cfg)?;
-                }
-                l if l.is::<TransformerBlock>() => {
-                    *l.downcast_mut::<TransformerBlock>().unwrap() =
-                        decode_from_std_read(&mut f_file, cfg)?;
-                }
-                l if l.is::<OutputProjection>() => {
-                    *l.downcast_mut::<OutputProjection>().unwrap() =
-                        decode_from_std_read(&mut f_file, cfg)?;
-                }
-                _ => unreachable!("unbekannter Layer-Typ beim Laden"),
+            let any = layer.as_any_mut();
+            if any.is::<Embeddings>() {
+                *any.downcast_mut::<Embeddings>().unwrap() =
+                    decode_from_std_read(&mut f_file, cfg)?;
+            } else if any.is::<TransformerBlockV2>() {
+                *any.downcast_mut::<TransformerBlockV2>().unwrap() =
+                    decode_from_std_read(&mut f_file, cfg)?;
+            } else if any.is::<OutputProjection>() {
+                *any.downcast_mut::<OutputProjection>().unwrap() =
+                    decode_from_std_read(&mut f_file, cfg)?;
+            } else {
+                unreachable!("unbekannter Layer-Typ beim Laden");
             }
         }
+
         Ok(())
     }
 }
@@ -514,14 +464,12 @@ impl LLM {
  */
 impl Default for LLM {
     fn default() -> Self {
-        // 1) Tokenizer basierend auf Byte-Alphabet
         let tokenizer = Tokenizer::new_byte_level();
-
-        // 2) Layer-Stack
         let i_vocab_size = tokenizer.vocab_size();
-        let embeddings = Box::new(Embeddings::default());
-        let transformer1 = Box::new(TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM));
-        let transformer2 = Box::new(TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM));
+
+        let embeddings = Box::new(Embeddings::from_tokenizer(&tokenizer));
+        let transformer1 = Box::new(TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, 8, 0.1));
+        let transformer2 = Box::new(TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, 8, 0.1));
         let output_layer = Box::new(OutputProjection::new(EMBEDDING_DIM, i_vocab_size));
 
         Self::new(
