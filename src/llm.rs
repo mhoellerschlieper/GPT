@@ -52,11 +52,18 @@ use crate::transformer_block_v2::TransformerBlockV2;
 use crate::{embeddings::Embeddings, layer_output_projection::OutputProjection};
 use anyhow::{Context, Result};
 use bincode::{config, decode_from_std_read, encode_into_std_write};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ndarray::Array2;
 use ndarray::Axis;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::sync::{Arc, atomic::AtomicBool};
+use std::time::{Duration, Instant};
+
+use std::cmp::Ordering as CmpOrdering;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::{any::Any, io::ErrorKind};
 
 // ----------------------------- Layer-Trait ----------------------------------
 /**
@@ -262,53 +269,144 @@ impl LLM {
      *  Die Gewichte aller Schichten werden mittels Adam optimiert.
      */
     pub fn train(&mut self, v_texts: Vec<&str>, i_epochs: usize, d_lr: f32) {
+        // 1) Stop-Flag (Ctrl+C oder Taste 'q')
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        {
+            let stop_flag_ctrlc = std::sync::Arc::clone(&stop_flag);
+            match ctrlc::set_handler(move || {
+                stop_flag_ctrlc.store(true, AtomicOrdering::SeqCst);
+            }) {
+                Ok(()) => {}
+                Err(ctrlc::Error::MultipleHandlers) => {
+                    // Handler war schon gesetzt. Alles okay. Weiter machen.
+                }
+                Err(e) => {
+                    eprintln!("Ctrl+C-Handler Warnung: {e}");
+                }
+            }
+        }
+
+        // 2) Dataset einmal tokenisieren (wie gehabt)
         let v_tokenized: Vec<Vec<usize>> = v_texts
             .iter()
             .map(|s| self.tokenizer.encode_text(s))
-            .collect::<Vec<_>>();
+            .collect();
 
         for i_epoch in 0..i_epochs {
-            let mut d_total_loss = 0.0f32;
+            let t_epoch_start = Instant::now();
+            let mut d_total_loss: f32 = 0.0;
             let mut i_steps: usize = 0;
+            let mut i_tokens_epoch: usize = 0;
+
+            // Hinweis: jederzeit abbrechbar
+            if stop_flag.load(AtomicOrdering::Relaxed) {
+                println!("Training abgebrochen (Ctrl+C)");
+                return;
+            }
 
             for v_sample in &v_tokenized {
-                let v_chunks = chunk_sequence(v_sample, MAX_SEQ_LEN / 5);
+                // Tastendruck 'q' (nicht blockierend)
+                if event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                    if let Ok(Event::Key(key)) = event::read() {
+                        if key.kind == KeyEventKind::Press {
+                            if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+                                println!("Training abgebrochen (Taste 'q')");
+                                return;
+                            }
+                        }
+                    }
+                }
+                if stop_flag.load(AtomicOrdering::Relaxed) {
+                    println!("Training abgebrochen (Ctrl+C)");
+                    return;
+                }
+
+                let v_chunks =
+                    crate::utils::chunk_sequence(v_sample, crate::config::MAX_SEQ_LEN / 5);
                 for v_chunk in v_chunks {
                     if v_chunk.len() < 2 {
-                        continue;
+                        continue; // zu kurz für Target-Shift
                     }
                     let v_input_ids = &v_chunk[..v_chunk.len() - 1];
                     let v_target_ids = &v_chunk[1..];
 
+                    // 3) Eingabetensor
                     let a_ids: ndarray::Array1<f32> =
                         ndarray::Array1::from_iter(v_input_ids.iter().map(|&id| id as f32));
                     let mut a_input: ndarray::Array2<f32> =
                         ndarray::Array2::zeros((1, v_input_ids.len()));
                     a_input.row_mut(0).assign(&a_ids);
 
+                    // 4) Forward-Pass
                     let mut a_forward = a_input;
                     for layer in &mut self.network {
                         a_forward = layer.forward(&a_forward);
                     }
 
+                    // 5) Loss
                     let a_probs = Self::softmax(&a_forward);
                     d_total_loss += Self::cross_entropy_loss_step(&a_probs, v_target_ids);
 
+                    // 6) Gradienten
                     let mut a_grads = Self::compute_gradients_step(&a_probs, v_target_ids);
                     Self::clip_gradients(&mut a_grads, 5.0);
 
+                    // 7) Backward-Pass
                     for layer in self.network.iter_mut().rev() {
                         a_grads = layer.backward(&a_grads, d_lr);
                     }
+
+                    // 8) Zähler
                     i_steps += 1;
+                    i_tokens_epoch += v_target_ids.len();
+
+                    // 9) Optional: häufiger Abbruch-Check
+                    if event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                        if let Ok(Event::Key(key)) = event::read() {
+                            if key.kind == KeyEventKind::Press {
+                                if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+                                    println!("Training abgebrochen (Taste 'q')");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if stop_flag.load(AtomicOrdering::Relaxed) {
+                        println!("Training abgebrochen (Ctrl+C)");
+                        return;
+                    }
                 }
             }
+
+            // 10) Epochen-Statistik: Loss + Tokens/Sekunde
+            let secs = t_epoch_start.elapsed().as_secs_f32().max(1e-6);
             let d_avg_loss = if i_steps > 0 {
                 d_total_loss / (i_steps as f32)
             } else {
                 0.0
             };
-            println!("Epoch {}  Loss {:.4}", i_epoch, d_avg_loss);
+            let tps = (i_tokens_epoch as f32) / secs;
+
+            println!(
+                "Epoch {}  Loss {:.4}  Tokens/s {:.0}  (Tokens: {}, Dauer: {:.2}s)",
+                i_epoch, d_avg_loss, tps, i_tokens_epoch, secs
+            );
+
+            // Direkt hier abbrechen, falls Taste gedrückt
+            if stop_flag.load(AtomicOrdering::Relaxed) {
+                println!("Training abgebrochen nach Epoch {}", i_epoch);
+                return;
+            }
+            if event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    if key.kind == KeyEventKind::Press {
+                        if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+                            println!("Training abgebrochen nach Epoch {} (Taste 'q')", i_epoch);
+                            return;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -335,7 +433,7 @@ impl LLM {
             .map_axis(Axis(1), |row| {
                 row.iter()
                     .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(CmpOrdering::Equal))
                     .map(|(idx, _)| idx)
                     .expect("row empty")
             })
@@ -458,7 +556,7 @@ impl LLM {
                 block.attention.clear_cache();
             }
         }
-
+        println!("Checkpoint loaded");
         Ok(())
     }
 }

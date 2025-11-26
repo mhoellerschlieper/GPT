@@ -10,8 +10,12 @@ serde     = { version = "1.0", features = ["derive"] }
 # bincode 2.0 mit beiden Feature-Flags:
 bincode   = { version = "2.0.1", features = ["derive", "serde"] }
 # falls benötigt
-ndarray   = { version = "0.15",  features = ["serde"] }
+ndarray   = { version = "0.15",  features = ["serde",  "rayon"] }
 
+half = { version = "2", features = ["serde"] }
+ctrlc = "3"
+crossterm = "0.27"
+rayon   = "1.8"
 anyhow    = "1.0"
 
 

@@ -8,6 +8,9 @@ use bincode::{Decode, Encode};
 use ndarray::{Array2, Axis, concatenate, s};
 use serde::{Deserialize, Serialize};
 
+use ndarray::parallel::prelude::*;
+use rayon::prelude::*;
+
 #[derive(Debug, Serialize, Deserialize, Encode, Decode)]
 pub enum AttentionError {
     EmptyCache,
@@ -36,6 +39,26 @@ pub struct MultiHeadAttention {
     pub f_decay: f32,
 }
 
+ pub fn softmax_rows_par(m: &Array2<f32>) -> Array2<f32> {
+        let mut out = m.clone();
+        out.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut row| {
+                let max_v = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for v in row.iter_mut() {
+                    *v = (*v - max_v).exp();
+                    sum += *v;
+                }
+                if sum > 0.0 {
+                    for v in row.iter_mut() {
+                        *v /= sum;
+                    }
+                }
+            });
+        out
+    }
+
 impl MultiHeadAttention {
     pub fn new(i_embed: usize, i_heads: usize, f_dropout: f32) -> Self {
         assert!(i_heads > 0, "i_heads muss > 0 sein");
@@ -58,11 +81,12 @@ impl MultiHeadAttention {
         }
     }
 
-     pub fn clear_cache(&mut self) {
+    pub fn clear_cache(&mut self) {
         self.v_cache_k = Some(Vec::new());
         self.v_cache_v = Some(Vec::new());
     }
 
+   
     pub fn forward(&mut self, m_x: &Array2<f32>, i_step: usize) -> Array2<f32> {
         // 1) Lineare Projektionen
         let m_qkv = m_x.dot(&self.w_qkv); // (seq, 3*embed)
@@ -75,7 +99,6 @@ impl MultiHeadAttention {
 
         // 2) RoPE
         apply_rope(m_q.view_mut(), m_k.view_mut(), i_step, self.i_head_dim);
-
 
         // 3) Cache (optional)
         let v_k = self.v_cache_k.get_or_insert_with(Vec::new);
@@ -90,6 +113,7 @@ impl MultiHeadAttention {
 
         // 5) Attention pro Head
         let scale = (self.i_head_dim as f32).sqrt();
+        /*
         let mut ctx_per_head: Vec<Array2<f32>> = Vec::with_capacity(self.i_heads);
         for h in 0..self.i_heads {
             let mut scores = q_heads[h].dot(&k_heads[h].t()); // (seq, seq)
@@ -101,7 +125,18 @@ impl MultiHeadAttention {
 
             let ctx = probs_dropped.dot(&v_heads[h]); // (seq, head_dim)
             ctx_per_head.push(ctx);
-        }
+        }*/
+        let ctx_per_head: Vec<Array2<f32>> = (0..self.i_heads)
+            .into_par_iter()
+            .map(|h| {
+                let mut scores = q_heads[h].dot(&k_heads[h].t()); // (seq, seq)
+                scores.mapv_inplace(|v| v / scale);
+                let probs = softmax_rows_par(&scores); // parallel-softmax (unten)
+                let mut probs_dropped = probs.clone();
+                dropout_inplace(&mut probs_dropped, self.f_dropout); // thread-safe: nutzt thread_rng()
+                probs_dropped.dot(&v_heads[h]) // (seq, head_dim)
+            })
+            .collect();
 
         // 6) Heads mergen: (seq, embed)
         let m_concat = self.merge_heads_vec(&ctx_per_head);
@@ -114,6 +149,7 @@ impl MultiHeadAttention {
         m_out
     }
 
+    
     fn split_heads_vec(&self, m: &Array2<f32>) -> Vec<Array2<f32>> {
         let mut out = Vec::with_capacity(self.i_heads);
         for h in 0..self.i_heads {

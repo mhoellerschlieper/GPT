@@ -7,6 +7,8 @@
 use ndarray::Array2;
 use rand::Rng;
 
+use half::{f16, bf16};
+
 pub const MAX_SEQ_LEN: usize = 80;
 
 /// Zerteilt eine Sequenz in ueberlappende Chunks.
@@ -53,4 +55,17 @@ pub fn apply_weight_decay(m_tensor: &mut Array2<f32>, f_lambda: f32) {
         let alpha = 1.0 - f_lambda;
         m_tensor.mapv_inplace(|v| v * alpha);
     }
+}
+
+pub fn to_f16(m: &Array2<f32>) -> Array2<f16> {
+    m.mapv(f16::from_f32)
+}
+pub fn from_f16(m: &Array2<f16>) -> Array2<f32> {
+    m.mapv(|h| f32::from(h))
+}
+pub fn to_bf16(m: &Array2<f32>) -> Array2<bf16> {
+    m.mapv(bf16::from_f32)
+}
+pub fn from_bf16(m: &Array2<bf16>) -> Array2<f32> {
+    m.mapv(|h| f32::from(h))
 }

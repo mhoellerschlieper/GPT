@@ -114,7 +114,11 @@ fn run_menu(llm: &mut LLM, dataset: &Dataset) -> io::Result<()> {
                         Ok(val) if val > 0 => break val,
                         _ => println!("Bitte eine positive Ganzzahl eingeben."),
                     }
+
+
                 };
+
+                println!("Abbruch mit <q>");
 
                 let pretraining_examples: Vec<&str> = dataset
                     .pretraining_data
@@ -167,6 +171,10 @@ fn run_menu(llm: &mut LLM, dataset: &Dataset) -> io::Result<()> {
 fn main() {
     println!("Initialisierung läuft …");
 
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(8) // z. B. 8 Kerne
+        .build_global();
+
     let dataset = Dataset::new(
         "data/pretraining_data_de.json".into(),
         "data/chat_training_data_de.json".into(),
@@ -211,11 +219,6 @@ fn main() {
         MAX_SEQ_LEN, EMBEDDING_DIM, HIDDEN_DIM
     );
     println!("Gesamtparameter       : {}", llm.total_parameters());
-
-    let s_sample_input = "User: Wie entstehen Gebirge?";
-    println!("\nBeispiel-Input  : {s_sample_input}");
-    let s_answer = llm.predict(s_sample_input);
-    println!("Vorhersage (raw): {}", s_answer);
 
     if let Err(e) = run_menu(&mut llm, &dataset) {
         eprintln!("Fehler im Menü: {e}");
