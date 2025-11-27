@@ -81,6 +81,11 @@ impl MultiHeadAttention {
         }
     }
 
+    pub fn parameter_count(&self) -> usize {
+        // Keine Bias-Felder vorhanden: nur w_qkv und w_o zählen.
+        self.w_qkv.len() + self.w_o.len()
+    }
+
     pub fn clear_cache(&mut self) {
         self.v_cache_k = Some(Vec::new());
         self.v_cache_v = Some(Vec::new());

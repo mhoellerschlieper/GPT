@@ -107,6 +107,18 @@ impl FeedForward {
             optimizer_b2: Adam::new((1,           embedding_dim)),
         }
     }
+
+    pub fn parameter_count(&self) -> usize {
+        let mut n: usize = 0;
+        n += self.w1.len();
+        n += self.b1.len();
+
+        n += self.w2.len();
+        n += self.b2.len();
+
+        
+        n
+    }
 }
 
 // ---------------------------------------------------------------------------

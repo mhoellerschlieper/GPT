@@ -105,20 +105,28 @@ fn run_menu(llm: &mut LLM, dataset: &Dataset) -> io::Result<()> {
                 Err(e) => println!("Fehler beim Speichern: {e}"),
             },
             "t" => {
+                
                 let i_epochs: usize = loop {
                     print!("Wie viele Epochen sollen verwendet werden? ");
-                    io::stdout().flush()?;
+                    std::io::stdout().flush()?;
                     let mut s_input = String::new();
-                    io::stdin().read_line(&mut s_input)?;
+                    std::io::stdin().read_line(&mut s_input)?;
                     match s_input.trim().parse::<usize>() {
                         Ok(val) if val > 0 => break val,
                         _ => println!("Bitte eine positive Ganzzahl eingeben."),
                     }
-
-
                 };
 
-                println!("Abbruch mit <q>");
+                let i_batch_size: usize = loop {
+                    print!("Batch-Groesse (z. B. 16): ");
+                    std::io::stdout().flush()?;
+                    let mut s_input = String::new();
+                    std::io::stdin().read_line(&mut s_input)?;
+                    match s_input.trim().parse::<usize>() {
+                        Ok(val) if val > 0 => break val,
+                        _ => println!("Bitte eine positive Ganzzahl eingeben."),
+                    }
+                };
 
                 let pretraining_examples: Vec<&str> = dataset
                     .pretraining_data
@@ -131,11 +139,13 @@ fn run_menu(llm: &mut LLM, dataset: &Dataset) -> io::Result<()> {
                     .map(|s| s.as_str())
                     .collect();
 
-                println!("Starte Pre-Training ({} Epochen) …", i_epochs);
-                llm.train(pretraining_examples, i_epochs, LEARN_RATE_PRETRAIN);
+                println!("Starte Pre-Training ({} Epochen, Batch={}) …", i_epochs, i_batch_size);
+                println!("Abbruch mit <q>");
 
-                println!("Starte Instruction-Tuning ({} Epochen) …", i_epochs);
-                llm.train(chat_training_examples, i_epochs, LEARN_RATE_TRAIN);
+                llm.train(pretraining_examples, i_epochs, LEARN_RATE_PRETRAIN, i_batch_size);
+
+                println!("Starte Instruction-Tuning ({} Epochen, Batch={}) …", i_epochs, i_batch_size);
+                llm.train(chat_training_examples, i_epochs, LEARN_RATE_TRAIN, i_batch_size);
 
                 println!("Training abgeschlossen.");
             }
@@ -196,6 +206,16 @@ fn main() {
     let transformer_block_3 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_4 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
 
+    let transformer_block_5 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
+    let transformer_block_6 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
+    let transformer_block_7 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
+
+    let transformer_block_8 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
+    let transformer_block_9 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
+    let transformer_block_10 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
+    let transformer_block_11 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
+    let transformer_block_12 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
+
     let output_projection = OutputProjection::new(EMBEDDING_DIM, i_vocab_size);
 
     let mut llm = LLM::new(
@@ -206,6 +226,16 @@ fn main() {
             Box::new(transformer_block_2),
             Box::new(transformer_block_3),
             Box::new(transformer_block_4),
+            Box::new(transformer_block_5),
+            Box::new(transformer_block_6),
+            Box::new(transformer_block_7),
+
+            Box::new(transformer_block_8),
+            Box::new(transformer_block_9),
+            Box::new(transformer_block_10),
+            Box::new(transformer_block_11),
+            Box::new(transformer_block_12),
+            
             Box::new(output_projection),
         ],
     );

@@ -64,6 +64,7 @@ use std::time::{Duration, Instant};
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::{any::Any, io::ErrorKind};
+use crate::layer_norm::LayerNorm;
 
 // ----------------------------- Layer-Trait ----------------------------------
 /**
@@ -74,6 +75,7 @@ use std::{any::Any, io::ErrorKind};
  */
 pub trait Layer {
     fn layer_type(&self) -> &str;
+    fn parameter_count(&self) -> usize { 0 } 
     fn forward(&mut self, input: &ndarray::Array2<f32>) -> ndarray::Array2<f32>;
     fn backward(&mut self, grads: &ndarray::Array2<f32>, d_lr: f32) -> ndarray::Array2<f32>;
     fn parameters(&self) -> usize;
@@ -151,6 +153,20 @@ impl LLM {
         }
     }
 
+    pub fn set_batch_accumulation(&mut self, batch_size: usize) {
+        let bsz = batch_size.max(1);
+        for layer in &mut self.network {
+            let any = layer.as_any_mut();
+
+            if let Some(op) = any.downcast_mut::<OutputProjection>() {
+                op.optimizer.set_accumulate_steps(bsz);
+            } else if let Some(ln) = any.downcast_mut::<LayerNorm>() {
+                ln.set_accumulate_steps(bsz);
+            }
+            // Weitere Layer mit Adam hier ergänzen …
+        }
+    }
+
     // ------------------------------------------------------------------------
     /// Liefert eine menschenlesbare Beschreibung des Layer-Stacks.
     pub fn network_description(&self) -> String {
@@ -164,7 +180,11 @@ impl LLM {
     // ------------------------------------------------------------------------
     /// Aggregiert die Gesamtzahl der lernbaren Parameter.
     pub fn total_parameters(&self) -> usize {
-        self.network.iter().map(|l| l.parameters()).sum()
+        let mut i_total: usize = 0;
+        for layer in &self.network {
+            i_total += layer.parameter_count();
+        }
+        i_total
     }
 
     // ------------------------------------------------------------------------
@@ -268,7 +288,11 @@ impl LLM {
      *  Führt Mini-Batch-ähnliches Training über ein Sliding-Window-Schema aus.
      *  Die Gewichte aller Schichten werden mittels Adam optimiert.
      */
-    pub fn train(&mut self, v_texts: Vec<&str>, i_epochs: usize, d_lr: f32) {
+    pub fn train(&mut self, v_texts: Vec<&str>, i_epochs: usize, d_lr: f32, batch_size: usize) {
+
+        // Batch-Accu aktivieren
+        self.set_batch_accumulation(batch_size);
+
         // 1) Stop-Flag (Ctrl+C oder Taste 'q')
         let stop_flag = Arc::new(AtomicBool::new(false));
         {

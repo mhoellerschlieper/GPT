@@ -31,6 +31,13 @@ impl FeedForwardGeGLU {
         }
     }
 
+    pub fn parameter_count(&self) -> usize {
+        let mut n: usize = 0;
+        n += self.w_in.len();
+        n += self.w_out.len();
+        n
+    }
+
     pub fn forward(&mut self, m_x: &Array2<f32>) -> Array2<f32> {
         let m_proj = m_x.dot(&self.w_in);
 

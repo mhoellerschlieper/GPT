@@ -127,6 +127,7 @@ impl Embeddings {
         Array2::from_shape_fn((max_seq_len, embedding_dim), |_| normal_dist.sample(&mut rng))
     }
 
+    
     // -----------------------------------------------------------------------
     //  Hilfsfunktionen (private)
     // -----------------------------------------------------------------------
@@ -185,6 +186,18 @@ impl Layer for Embeddings {
     fn as_any(&self) -> &dyn Any       { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
+    fn parameter_count(&self) -> usize {
+        let mut i_total: usize = 0;
+        i_total += self.token_embeddings.len();
+        i_total += self.positional_embeddings.len();
+
+        // Variante für Option:
+        // if let Some(pe) = &self.positional_embeddings {
+        //     i_total += pe.len();
+        // }
+
+        i_total
+    }
     /// Forward-Pass: wandelt Token-IDs in Embeddings um.
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // Erwartete Eingabeform: [1, sequence_length]

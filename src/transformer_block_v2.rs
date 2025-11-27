@@ -2,36 +2,35 @@
 *  transformer_block_v2.rs  –  Erweiterter Decoder-Block (kompakt)
 ***********************************************************************/
 // transformer_block_v2.rs
-use std::any::Any;
-use serde::{Serialize, Deserialize};
-use bincode::{Encode, Decode};
-use ndarray::Array2;
-use crate::layer_norm::LayerNorm;
-use crate::multi_head_attention::MultiHeadAttention;
 use crate::feed_forward_geglu::FeedForwardGeGLU;
+use crate::layer_norm::LayerNorm;
 use crate::layer_time2vec::Time2Vec;
-use crate::utils::dropout_inplace;
 use crate::llm::Layer;
+use crate::multi_head_attention::MultiHeadAttention;
+use crate::utils::dropout_inplace;
+use bincode::{Decode, Encode};
+use ndarray::Array2;
+use serde::{Deserialize, Serialize};
+use std::any::Any;
 
 #[derive(Serialize, Deserialize, Encode, Decode)]
 pub struct TransformerBlockV2 {
-    pub norm1:       LayerNorm,
-    pub attention:   MultiHeadAttention,
-    pub norm2:       LayerNorm,
+    pub norm1: LayerNorm,
+    pub attention: MultiHeadAttention,
+    pub norm2: LayerNorm,
     pub feedforward: FeedForwardGeGLU,
-    pub time_embed:  Time2Vec,
-    pub f_dropout:   f32,
+    pub time_embed: Time2Vec,
+    pub f_dropout: f32,
 }
-
 
 impl TransformerBlockV2 {
     pub fn new(i_embed: usize, i_hidden: usize, i_heads: usize, f_dropout: f32) -> Self {
         TransformerBlockV2 {
-            norm1:       LayerNorm::new(i_embed),
-            attention:   MultiHeadAttention::new(i_embed, i_heads, f_dropout),
-            norm2:       LayerNorm::new(i_embed),
+            norm1: LayerNorm::new(i_embed),
+            attention: MultiHeadAttention::new(i_embed, i_heads, f_dropout),
+            norm2: LayerNorm::new(i_embed),
             feedforward: FeedForwardGeGLU::new(i_embed, i_hidden, f_dropout),
-            time_embed:  Time2Vec::new(i_embed),
+            time_embed: Time2Vec::new(i_embed),
             f_dropout,
         }
     }
@@ -39,7 +38,7 @@ impl TransformerBlockV2 {
     fn forward_step(&mut self, m_x: &Array2<f32>, d_timestamp: f32, i_step: usize) -> Array2<f32> {
         // Zeit-Features + PreNorm
         let m_x_time = self.time_embed.add_time_axis(m_x, d_timestamp);
-        let m_norm1  = self.norm1.normalize(&m_x_time);
+        let m_norm1 = self.norm1.normalize(&m_x_time);
 
         // Attention + Residual
         let m_attn = self.attention.forward(&m_norm1, i_step);
@@ -56,10 +55,27 @@ impl TransformerBlockV2 {
 }
 
 impl Layer for TransformerBlockV2 {
-    fn layer_type(&self) -> &str { "TransformerBlockV2" }
+    fn layer_type(&self) -> &str {
+        "TransformerBlockV2"
+    }
 
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn parameter_count(&self) -> usize {
+        let mut i_total: usize = 0;
+        i_total += self.attention.parameter_count();
+        i_total += self.feedforward.parameter_count();
+        i_total += self.norm1.parameter_count();
+        i_total += self.norm2.parameter_count();
+        // Optional: falls time_embed trainierbar ist:
+        // i_total += self.time_embed.len();
+        i_total
+    }
 
     // Hinweis: LLM ruft forward ohne Zeit/Step auf.
     // Wir nutzen Defaults (0.0, 0) fuer einfache Inferenz/Training.

@@ -41,6 +41,17 @@ impl OutputProjection {
             cached_input: None,
         }
     }
+
+    fn parameter_count(&self) -> usize {
+        let mut i_total: usize = 0;
+        i_total += self.w_out.len();
+        i_total += self.b_out.len();
+        i_total
+    }
+
+    pub fn set_accumulate_steps(&mut self, steps: usize) {
+        self.optimizer.set_accumulate_steps(steps);
+    }
 }
 
 impl Layer for OutputProjection {
@@ -48,6 +59,8 @@ impl Layer for OutputProjection {
 
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         self.cached_input = Some(input.clone());

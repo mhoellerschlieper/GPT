@@ -77,6 +77,16 @@ impl LayerNorm {
         }
     }
 
+    pub fn parameter_count(&self) -> usize {
+        self.gamma.len() + self.beta.len()
+    }
+
+    // Batch-Akkumulation für beide Optimizer setzen (öffentlich)
+    pub fn set_accumulate_steps(&mut self, steps: usize) {
+        self.optimizer_gamma.set_accumulate_steps(steps);
+        self.optimizer_beta.set_accumulate_steps(steps);
+    }
+
     /// Vorwärts: Normalisierung + affine Transformation.
     /// Korrekt: denom = sqrt(var + epsilon)
     pub fn normalize(&mut self, input: &Array2<f32>) -> Array2<f32> {
