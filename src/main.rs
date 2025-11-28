@@ -43,8 +43,8 @@ mod layer_pos_encoding;
 use crate::tokenizer_bpe::Tokenizer;
 use crate::config::{EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN};
 
-const LEARN_RATE_PRETRAIN: f32 = 5e-4;
-const LEARN_RATE_TRAIN: f32 = 1e-4;
+const LEARN_RATE_PRETRAIN: f32 = 1e-5;
+const LEARN_RATE_TRAIN:    f32 = 5e-6;
 
 // Hyperparameter fuer TransformerBlockV2
 const HEADS: usize = 8;

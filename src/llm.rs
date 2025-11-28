@@ -154,18 +154,24 @@ impl LLM {
     }
 
     pub fn set_batch_accumulation(&mut self, batch_size: usize) {
-        let bsz = batch_size.max(1);
-        for layer in &mut self.network {
-            let any = layer.as_any_mut();
-
-            if let Some(op) = any.downcast_mut::<OutputProjection>() {
-                op.optimizer.set_accumulate_steps(bsz);
-            } else if let Some(ln) = any.downcast_mut::<LayerNorm>() {
-                ln.set_accumulate_steps(bsz);
-            }
-            // Weitere Layer mit Adam hier ergänzen …
+    let bsz = batch_size.max(1);
+    for layer in &mut self.network {
+        let any = layer.as_any_mut();
+        if let Some(op) = any.downcast_mut::<crate::layer_output_projection::OutputProjection>() {
+            op.set_accumulate_steps(bsz);
+        } else if let Some(ln) = any.downcast_mut::<crate::layer_norm::LayerNorm>() {
+            ln.set_accumulate_steps(bsz);
+        } else if let Some(block) = any.downcast_mut::<crate::transformer_block_v2::TransformerBlockV2>() {
+            // Normen
+            block.norm1.set_accumulate_steps(bsz);
+            block.norm2.set_accumulate_steps(bsz);
+            // MHA + FF GeGLU
+            block.attention.set_accumulate_steps(bsz);
+            block.feedforward.set_accumulate_steps(bsz);
         }
+        // Weitere Layer bei Bedarf ...
     }
+}
 
     // ------------------------------------------------------------------------
     /// Liefert eine menschenlesbare Beschreibung des Layer-Stacks.
@@ -366,6 +372,8 @@ impl LLM {
                     for layer in &mut self.network {
                         a_forward = layer.forward(&a_forward);
                     }
+                    assert_eq!(a_forward.shape()[0], v_target_ids.len(), "row mismatch: logits vs targets");
+                    assert_eq!(a_forward.shape()[1], self.tokenizer.vocab_size(), "cols != vocab size");
 
                     // 5) Loss
                     let a_probs = Self::softmax(&a_forward);
@@ -373,7 +381,7 @@ impl LLM {
 
                     // 6) Gradienten
                     let mut a_grads = Self::compute_gradients_step(&a_probs, v_target_ids);
-                    Self::clip_gradients(&mut a_grads, 5.0);
+                    Self::clip_gradients(&mut a_grads, 1.0);
 
                     // 7) Backward-Pass
                     for layer in self.network.iter_mut().rev() {

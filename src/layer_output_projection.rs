@@ -8,21 +8,23 @@
 // ===========================================================================
 use std::any::Any;
 
+use bincode::{Decode, Encode};
 use ndarray::{Array2, Axis};
 use rand_distr::{Distribution, Normal};
-use bincode::{Encode, Decode};
-use serde   ::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::{adam::Adam, llm::Layer};
 
 #[derive(Serialize, Deserialize, Encode, Decode)]
 pub struct OutputProjection {
-    #[bincode(with_serde)] pub w_out: Array2<f32>,   // [embedding_dim, vocab_size]
-    #[bincode(with_serde)] pub b_out: Array2<f32>,   // [1, vocab_size]
-
     #[bincode(with_serde)]
-    pub optimizer: Adam,
-
+    pub w_out: Array2<f32>,
+    #[bincode(with_serde)]
+    pub b_out: Array2<f32>,
+    #[bincode(with_serde)]
+    pub optimizer_w: Adam,
+    #[bincode(with_serde)]
+    pub optimizer_b: Adam,
     #[serde(skip)]
     #[bincode(with_serde)]
     pub cached_input: Option<Array2<f32>>,
@@ -36,10 +38,16 @@ impl OutputProjection {
 
         OutputProjection {
             w_out: Array2::from_shape_fn((embedding_dim, vocab_size), |_| normal.sample(&mut rng)),
-            b_out: Array2::<f32>::zeros((1, vocab_size)),
-            optimizer: Adam::new((embedding_dim, vocab_size)),
+            b_out: Array2::zeros((1, vocab_size)),
+            optimizer_w: Adam::new((embedding_dim, vocab_size)),
+            optimizer_b: Adam::new((1, vocab_size)),
             cached_input: None,
         }
+    }
+
+    pub fn set_accumulate_steps(&mut self, steps: usize) {
+        self.optimizer_w.set_accumulate_steps(steps);
+        self.optimizer_b.set_accumulate_steps(steps);
     }
 
     fn parameter_count(&self) -> usize {
@@ -48,19 +56,19 @@ impl OutputProjection {
         i_total += self.b_out.len();
         i_total
     }
-
-    pub fn set_accumulate_steps(&mut self, steps: usize) {
-        self.optimizer.set_accumulate_steps(steps);
-    }
 }
 
 impl Layer for OutputProjection {
-    fn layer_type(&self) -> &str { "OutputProjection" }
+    fn layer_type(&self) -> &str {
+        "OutputProjection"
+    }
 
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
-
-    
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         self.cached_input = Some(input.clone());
@@ -68,18 +76,14 @@ impl Layer for OutputProjection {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        let input = self.cached_input.as_ref()
-            .expect("forward muss vor backward aufgerufen werden");
-
+        let input = self.cached_input.as_ref().expect("forward vor backward");
         let grad_w_out = input.t().dot(grads);
-        let grad_b_out = grads.mean_axis(Axis(0)).expect("mean_axis schlug fehl"); // [vocab]
-        let grad_b_out_2d = grad_b_out.insert_axis(Axis(0)); // [1, vocab]
+        let grad_b_out = grads.sum_axis(Axis(0)).insert_axis(Axis(0)); // Summe, Adam mittelt selbst
 
         let grad_input = grads.dot(&self.w_out.t());
 
-        self.optimizer.step(&mut self.w_out, &grad_w_out, lr);
-        self.b_out -= &(lr * &grad_b_out_2d);
-
+        self.optimizer_w.step(&mut self.w_out, &grad_w_out, lr);
+        self.optimizer_b.step(&mut self.b_out, &grad_b_out, lr);
         grad_input
     }
 
