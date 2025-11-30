@@ -1,59 +1,27 @@
+// main.rs
 // ============================================================================
-// Autor      : Marcus Schlieper (ExpChat.ai)
-// Erstellt   : 22.11.2025
-// Datei      : main.rs – Einstiegspunkt der Anwendung
-// Historie   : 22.11.2025  MS  Erste Version mit interaktivem Menü
-//              22.11.2025  MS  BPE-Tokenizer-Training + Persistenz integriert
-//              26.11.2025  MS  Build-Fixes, Modulpfade, Typen, Menu-Parsing
+// Autor:    Marcus Schlieper (ExpChat.ai)
+// Kontakt:  mschlieper@ylook.de | Tel: 49 2338 8748862 | Mobil: 49 15115751864
+// Firma:    ExpChat.ai – Der KI Chat Client fuer den Mittelstand
+// Adresse:  Epscheider Str21, 58339 Breckerfeld
+// Hinweis:  Einstiegspunkt. Initialisiert Tokenizer, Modell, Menu und Training.
 // ============================================================================
 
-use std::{
-    io::{self, Write},
-    path::Path,
-};
+#![forbid(unsafe_code)]
 
-use crate::dataset_loader::{Dataset, DatasetType};
-
-use crate::{
-    embeddings::Embeddings,
-    layer_output_projection::OutputProjection,
-    llm::LLM,
-    transformer_block_v2::TransformerBlockV2,
-};
-
-mod config;
-mod adam;
-mod dataset_loader;
-mod embeddings;
-mod feed_forward;
-mod layer_norm;
-mod llm;
-mod layer_output_projection;
-mod layer_self_attention;
-mod tokenizer_bpe;
-mod transformer_block_v2;
-
-// neue Module (Fixes)
-mod multi_head_attention;
-mod feed_forward_geglu;
-mod layer_time2vec;
+mod layers;
+mod train;
+mod math;
 mod utils;
-mod layer_pos_encoding;
 
-use crate::tokenizer_bpe::Tokenizer;
-use crate::config::{EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN};
+use std::io::{self, Write};
+use std::path::Path;
 
-const LEARN_RATE_PRETRAIN: f32 = 1e-5;
-const LEARN_RATE_TRAIN:    f32 = 5e-6;
+use layers::{Embeddings, OutputProjection, TransformerBlockV2};
+use train::LLM;
+use utils::{Dataset, DatasetType, Tokenizer, EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT, MAX_SEQ_LEN, LEARN_RATE_PRETRAIN, LEARN_RATE_TRAIN};
 
-// Hyperparameter fuer TransformerBlockV2
-const HEADS: usize = 8;
-const DROPOUT: f32 = 0.1;
-
-/// ---------------------------------------------------------------------------
-/// prepare_tokenizer
-/// ---------------------------------------------------------------------------
-fn prepare_tokenizer(korpus: &[String], i_merge_limit: usize) -> Tokenizer {
+fn prepare_tokenizer(corpus: &[String], i_merge_limit: usize) -> Tokenizer {
     const P_VOCAB: &str = "data/bpe_vocab.bin";
     const P_MERGES: &str = "data/bpe_merges.txt";
 
@@ -67,24 +35,17 @@ fn prepare_tokenizer(korpus: &[String], i_merge_limit: usize) -> Tokenizer {
         }
     }
 
-    println!("Starte einmaliges BPE-Training ({} Merges) …", i_merge_limit);
+    println!("Starte einmaliges BPE-Training ({i_merge_limit} Merges) ...");
     let mut tokenizer = Tokenizer::new_byte_level();
-    tokenizer.train_bpe(korpus, i_merge_limit);
-
-    tokenizer
-        .save(P_VOCAB, P_MERGES)
-        .expect("Tokenizer-Persistenz fehlgeschlagen");
-    println!("Tokenizer gespeichert unter {}, {}", P_VOCAB, P_MERGES);
-
+    tokenizer.train_bpe(corpus, i_merge_limit);
+    tokenizer.save(P_VOCAB, P_MERGES).expect("Tokenizer-Persistenz fehlgeschlagen");
+    println!("Tokenizer gespeichert unter {P_VOCAB}, {P_MERGES}");
     tokenizer
 }
 
-/// ---------------------------------------------------------------------------
-/// run_menu
-/// ---------------------------------------------------------------------------
 fn run_menu(llm: &mut LLM, dataset: &Dataset) -> io::Result<()> {
     loop {
-        println!("\n===== HAUPTMENÜ =====");
+        println!("\n===== HAUPTMENU =====");
         println!("  l – Modell laden");
         println!("  s – Modell speichern");
         println!("  t – Modell trainieren");
@@ -105,9 +66,19 @@ fn run_menu(llm: &mut LLM, dataset: &Dataset) -> io::Result<()> {
                 Err(e) => println!("Fehler beim Speichern: {e}"),
             },
             "t" => {
-                
-                let i_epochs: usize = loop {
-                    print!("Wie viele Epochen sollen verwendet werden? ");
+                let i_epochs_pretrain: usize = loop {
+                    print!("Wie viele Epochen Vortraining? ");
+                    std::io::stdout().flush()?;
+                    let mut s_input = String::new();
+                    std::io::stdin().read_line(&mut s_input)?;
+                    match s_input.trim().parse::<usize>() {
+                        Ok(val) if val > 0 => break val,
+                        _ => println!("Bitte eine positive Ganzzahl eingeben."),
+                    }
+                };
+
+                let i_epochs_train: usize = loop {
+                    print!("Wie viele Epochen Haupttraining? ");
                     std::io::stdout().flush()?;
                     let mut s_input = String::new();
                     std::io::stdin().read_line(&mut s_input)?;
@@ -128,24 +99,14 @@ fn run_menu(llm: &mut LLM, dataset: &Dataset) -> io::Result<()> {
                     }
                 };
 
-                let pretraining_examples: Vec<&str> = dataset
-                    .pretraining_data
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
-                let chat_training_examples: Vec<&str> = dataset
-                    .chat_training_data
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
+                let pretraining_examples: Vec<&str> = dataset.pretraining_data.iter().map(|s| s.as_str()).collect();
+                let chat_training_examples: Vec<&str> = dataset.chat_training_data.iter().map(|s| s.as_str()).collect();
 
-                println!("Starte Pre-Training ({} Epochen, Batch={}) …", i_epochs, i_batch_size);
-                println!("Abbruch mit <q>");
+                println!("Starte Pre-Training ({i_epochs_pretrain} Epochen, Batch={i_batch_size}) ...");
+                llm.train(pretraining_examples, i_epochs_pretrain, LEARN_RATE_PRETRAIN, i_batch_size);
 
-                llm.train(pretraining_examples, i_epochs, LEARN_RATE_PRETRAIN, i_batch_size);
-
-                println!("Starte Instruction-Tuning ({} Epochen, Batch={}) …", i_epochs, i_batch_size);
-                llm.train(chat_training_examples, i_epochs, LEARN_RATE_TRAIN, i_batch_size);
+                println!("Starte Instruction-Tuning ({i_epochs_train} Epochen, Batch={i_batch_size}) ...");
+                llm.train(chat_training_examples, i_epochs_train, LEARN_RATE_TRAIN, i_batch_size);
 
                 println!("Training abgeschlossen.");
             }
@@ -175,15 +136,10 @@ fn run_menu(llm: &mut LLM, dataset: &Dataset) -> io::Result<()> {
     Ok(())
 }
 
-/// ---------------------------------------------------------------------------
-/// main
-/// ---------------------------------------------------------------------------
 fn main() {
-    println!("Initialisierung läuft …");
+    println!("Initialisierung laeuft ...");
 
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(8) // z. B. 8 Kerne
-        .build_global();
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(8).build_global();
 
     let dataset = Dataset::new(
         "data/pretraining_data_de.json".into(),
@@ -205,11 +161,9 @@ fn main() {
     let transformer_block_2 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_3 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_4 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
-
     let transformer_block_5 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_6 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_7 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
-
     let transformer_block_8 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_9 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_10 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
@@ -229,13 +183,11 @@ fn main() {
             Box::new(transformer_block_5),
             Box::new(transformer_block_6),
             Box::new(transformer_block_7),
-
             Box::new(transformer_block_8),
             Box::new(transformer_block_9),
             Box::new(transformer_block_10),
             Box::new(transformer_block_11),
             Box::new(transformer_block_12),
-            
             Box::new(output_projection),
         ],
     );
@@ -251,6 +203,6 @@ fn main() {
     println!("Gesamtparameter       : {}", llm.total_parameters());
 
     if let Err(e) = run_menu(&mut llm, &dataset) {
-        eprintln!("Fehler im Menü: {e}");
+        eprintln!("Fehler im Menu: {e}");
     }
 }
