@@ -16,11 +16,12 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 use std::time::Instant;
-use std::io::Write;
+
+use std::io::{self, Write};
 
 use crate::layers::{Layer, Embeddings, OutputProjection, TransformerBlockV2};
 use crate::math::{softmax, cross_entropy_loss_step, compute_gradients_step, clip_gradients};
-use crate::utils::{Tokenizer, MAX_SEQ_LEN, EMBEDDING_DIM, chunk_sequence};
+use crate::utils::{Tokenizer, MAX_SEQ_LEN, EMBEDDING_DIM, S_EOS, chunk_sequence};
 
 pub struct LLM {
     pub tokenizer: Tokenizer,
@@ -116,6 +117,20 @@ impl LLM {
                 v_context_tokens.push(i_next);
                 v_generated_tokens.push(i_next);
 
+                // Streaming: Token sofort decodieren und anzeigen
+                let s_piece: String = self.tokenizer.decode_tokens(&[i_next]);
+
+                if s_piece.contains(S_EOS){
+                    break;
+                }
+
+                if let Err(_e) = write!(io::stdout(), "{}]", s_piece) {
+                    eprintln!("stdout write failed");
+                }
+                if let Err(_e) = io::stdout().flush() {
+                    eprintln!("stdout flush failed");
+                }
+
                 if v_context_tokens.len() >= MAX_SEQ_LEN {
                     break;
                 }
@@ -130,6 +145,9 @@ impl LLM {
             }
             v_output_global.extend_from_slice(&v_generated_tokens);
         }
+        
+        let _ = writeln!(io::stdout(), "");
+
         v_output_global
     }
 

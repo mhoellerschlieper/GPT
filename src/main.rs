@@ -122,8 +122,11 @@ fn run_menu(llm: &mut LLM, dataset: &Dataset) -> io::Result<()> {
                         break;
                     }
                     let s_formatted = format!("User: {}", s_trimmed);
+                    
+                    print!("Antwort:");
+
                     let s_answer = llm.predict(&s_formatted);
-                    println!("Antwort: {s_answer}");
+                    //println!("Antwort: {s_answer}");
                 }
             }
             "e" => {

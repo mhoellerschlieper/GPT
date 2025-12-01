@@ -1,3 +1,4 @@
+// ============================================================================/
 // layers.rs
 // ============================================================================
 // Autor:    Marcus Schlieper (ExpChat.ai)
@@ -35,13 +36,15 @@ use crate::utils::{Tokenizer, MAX_SEQ_LEN, EMBEDDING_DIM};
 
 pub trait Layer {
     fn layer_type(&self) -> &str;
-    fn parameter_count(&self) -> usize { 0 }
+    fn parameter_count(&self) -> usize;
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32>;
     fn backward(&mut self, grads: &Array2<f32>, d_lr: f32) -> Array2<f32>;
-    fn parameters(&self) -> usize;
-
+    
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    
+    fn parameters(&self) -> usize { self.parameter_count() }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +251,10 @@ impl Layer for LayerNorm {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
+    fn parameter_count(&self) -> usize {
+        self.m_gamma.len() + self.m_beta.len()
+    }
+
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         self.normalize(input)
     }
@@ -400,6 +407,10 @@ impl Layer for MultiHeadAttention {
 
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn parameter_count(&self) -> usize {
+        self.w_qkv.len() + self.w_o.len()
+    }
 
     fn forward(&mut self, m_x: &Array2<f32>) -> Array2<f32> {
         self.cached_input = Some(m_x.clone());
@@ -856,6 +867,10 @@ impl Layer for OutputProjection {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
+    fn parameter_count(&self) -> usize {
+        self.w_out.len() + self.b_out.len()
+    }
+
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         assert_eq!(input.ncols(), self.w_out.nrows(), "embed mismatch");
         assert_eq!(self.b_out.ncols(), self.w_out.ncols(), "bias size mismatch");
@@ -926,6 +941,14 @@ impl Layer for TransformerBlockV2 {
 
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn parameter_count(&self) -> usize {
+        self.norm1.parameter_count()
+            + self.attention.parameter_count()
+            + self.norm2.parameter_count()
+            + self.feedforward.parameter_count()
+    }
+
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // Pre-Norm Attention
