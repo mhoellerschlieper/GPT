@@ -47,7 +47,7 @@ impl Adam {
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
-            wd: 0.00, // weight decay, z. B. 0.01
+            wd: 0.01, // weight decay, z. B. 0.01
         }
     }
 

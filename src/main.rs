@@ -8,6 +8,7 @@
 // ============================================================================
 
 #![forbid(unsafe_code)]
+#![allow(warnings)]
 
 mod layers;
 mod train;
@@ -121,7 +122,7 @@ fn run_menu(llm: &mut LLM, dataset: &Dataset) -> io::Result<()> {
                     if s_trimmed.eq_ignore_ascii_case("fertig") {
                         break;
                     }
-                    let s_formatted = format!("User: {}", s_trimmed);
+                    let s_formatted = format!("User: {} Assistant: ", s_trimmed);
                     
                     print!("Antwort:");
 
@@ -166,12 +167,13 @@ fn main() {
     let transformer_block_4 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_5 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_6 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
-    let transformer_block_7 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
+    /* let transformer_block_7 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_8 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_9 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_10 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_11 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
     let transformer_block_12 = TransformerBlockV2::new(EMBEDDING_DIM, HIDDEN_DIM, HEADS, DROPOUT);
+    */
 
     let output_projection = OutputProjection::new(EMBEDDING_DIM, i_vocab_size);
 
@@ -185,12 +187,6 @@ fn main() {
             Box::new(transformer_block_4),
             Box::new(transformer_block_5),
             Box::new(transformer_block_6),
-            Box::new(transformer_block_7),
-            Box::new(transformer_block_8),
-            Box::new(transformer_block_9),
-            Box::new(transformer_block_10),
-            Box::new(transformer_block_11),
-            Box::new(transformer_block_12),
             Box::new(output_projection),
         ],
     );
