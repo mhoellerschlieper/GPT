@@ -12,11 +12,16 @@ use std::{fs, path::Path};
 
 // ---------------- Config ----------------
 
-pub const MAX_SEQ_LEN: usize = 80;
+pub const MAX_SEQ_LEN_CANONICAL: usize = 256;
+
+// Backward compatible alias: use only if other modules still reference MAX_SEQ_LEN.
+pub const MAX_SEQ_LEN: usize = MAX_SEQ_LEN_CANONICAL;
+
 pub const EMBEDDING_DIM: usize = 256;
 pub const HIDDEN_DIM: usize = 1024;
 pub const HEADS: usize = 8;
 pub const DROPOUT: f32 = 0.1;
+
 pub const LEARN_RATE_PRETRAIN: f32 = 1e-3;
 pub const LEARN_RATE_TRAIN: f32 = 5e-4;
 

@@ -17,18 +17,19 @@
 #![forbid(unsafe_code)]
 
 use bincode::{Decode, Encode};
-use ndarray::{Array2, Axis, Zip, concatenate, Slice};
+use ndarray::{Array2, Axis, Slice, Zip, concatenate};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
 use rand::Rng;
 
 use crate::math::{
-    Adam, apply_weight_decay,
-    softmax_rows_par, softmax_backward_rows,
-    apply_rope, apply_rope_backward,
+    Adam, apply_rope, apply_rope_backward, apply_weight_decay, softmax_backward_rows,
+    softmax_rows_par,
 };
-use crate::utils::{Tokenizer, MAX_SEQ_LEN, EMBEDDING_DIM};
+
+use crate::tokenize::Tokenizer;
+use crate::utils::{EMBEDDING_DIM, MAX_SEQ_LEN, MAX_SEQ_LEN_CANONICAL};
 
 // ---------------------------------------------------------------------------
 // Trait: Layer
@@ -39,12 +40,13 @@ pub trait Layer {
     fn parameter_count(&self) -> usize;
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32>;
     fn backward(&mut self, grads: &Array2<f32>, d_lr: f32) -> Array2<f32>;
-    
+
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
-    
-    fn parameters(&self) -> usize { self.parameter_count() }
+    fn parameters(&self) -> usize {
+        self.parameter_count()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -54,7 +56,7 @@ pub trait Layer {
 #[derive(Serialize, Deserialize, Encode, Decode)]
 pub struct Embeddings {
     #[bincode(with_serde)]
-    pub token_embeddings: Array2<f32>,      // [vocab, embed]
+    pub token_embeddings: Array2<f32>, // [vocab, embed]
     #[bincode(with_serde)]
     pub positional_embeddings: Array2<f32>, // [max_seq, embed]
 
@@ -73,10 +75,13 @@ impl Embeddings {
         let i_vocab_size = tokenizer.vocab_size();
         Self {
             token_embeddings: Self::init_embeddings(i_vocab_size, EMBEDDING_DIM),
-            positional_embeddings: Self::init_positional_embeddings(MAX_SEQ_LEN, EMBEDDING_DIM),
+            positional_embeddings: Self::init_positional_embeddings(
+                MAX_SEQ_LEN_CANONICAL,
+                EMBEDDING_DIM,
+            ),
             cached_input: None,
             token_optimizer: Adam::new((i_vocab_size, EMBEDDING_DIM)),
-            positional_optimizer: Adam::new((MAX_SEQ_LEN, EMBEDDING_DIM)),
+            positional_optimizer: Adam::new((MAX_SEQ_LEN_CANONICAL, EMBEDDING_DIM)),
         }
     }
 
@@ -113,7 +118,8 @@ impl Embeddings {
         assert!(
             i_seq <= m_pos.nrows(),
             "sequence length exceeds maximum: {} > {}",
-            i_seq, m_pos.nrows()
+            i_seq,
+            m_pos.nrows()
         );
         m_pos.slice_axis(Axis(0), Slice::from(0..i_seq)).to_owned()
     }
@@ -126,10 +132,16 @@ impl Embeddings {
 }
 
 impl Layer for Embeddings {
-    fn layer_type(&self) -> &str { "Embeddings" }
+    fn layer_type(&self) -> &str {
+        "Embeddings"
+    }
 
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 
     fn parameter_count(&self) -> usize {
         self.token_embeddings.len() + self.positional_embeddings.len()
@@ -150,7 +162,10 @@ impl Layer for Embeddings {
         let mut m_grad_pos = Array2::<f32>::zeros(self.positional_embeddings.dim());
 
         for (i_row, &i_tok) in v_ids.iter().enumerate() {
-            assert!(i_tok < self.token_embeddings.nrows(), "token id out of bounds");
+            assert!(
+                i_tok < self.token_embeddings.nrows(),
+                "token id out of bounds"
+            );
             let grad_row = grads.row(i_row);
             {
                 let mut row_tok = m_grad_tok.row_mut(i_tok);
@@ -162,8 +177,10 @@ impl Layer for Embeddings {
             }
         }
 
-        self.token_optimizer.step(&mut self.token_embeddings, &m_grad_tok, d_lr);
-        self.positional_optimizer.step(&mut self.positional_embeddings, &m_grad_pos, d_lr);
+        self.token_optimizer
+            .step(&mut self.token_embeddings, &m_grad_tok, d_lr);
+        self.positional_optimizer
+            .step(&mut self.positional_embeddings, &m_grad_pos, d_lr);
 
         // Gradient zum vorigen Layer: hier einfach durchreichen
         grads.to_owned()
@@ -184,7 +201,7 @@ pub struct LayerNorm {
     #[bincode(with_serde)]
     m_gamma: Array2<f32>, // [1, embed]
     #[bincode(with_serde)]
-    m_beta: Array2<f32>,  // [1, embed]
+    m_beta: Array2<f32>, // [1, embed]
 
     #[serde(skip)]
     #[bincode(with_serde)]
@@ -230,7 +247,10 @@ impl LayerNorm {
     }
 
     fn normalize(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        let m_mean = input.mean_axis(Axis(1)).expect("mean failed").insert_axis(Axis(1));
+        let m_mean = input
+            .mean_axis(Axis(1))
+            .expect("mean failed")
+            .insert_axis(Axis(1));
         let m_var = input.var_axis(Axis(1), 0.0).insert_axis(Axis(1));
         let m_denom = (m_var.mapv(|v| v + self.d_epsilon)).mapv(|v| v.sqrt());
         let m_x_hat = (input - &m_mean) / &m_denom;
@@ -246,10 +266,16 @@ impl LayerNorm {
 }
 
 impl Layer for LayerNorm {
-    fn layer_type(&self) -> &str { "LayerNorm" }
+    fn layer_type(&self) -> &str {
+        "LayerNorm"
+    }
 
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 
     fn parameter_count(&self) -> usize {
         self.m_gamma.len() + self.m_beta.len()
@@ -304,7 +330,7 @@ pub struct MultiHeadAttention {
     #[bincode(with_serde)]
     pub w_qkv: Array2<f32>, // [embed, 3*embed]
     #[bincode(with_serde)]
-    pub w_o: Array2<f32>,   // [embed, embed]
+    pub w_o: Array2<f32>, // [embed, embed]
 
     #[bincode(with_serde)]
     opt_qkv: Adam,
@@ -403,10 +429,16 @@ impl MultiHeadAttention {
 }
 
 impl Layer for MultiHeadAttention {
-    fn layer_type(&self) -> &str { "MultiHeadAttention" }
+    fn layer_type(&self) -> &str {
+        "MultiHeadAttention"
+    }
 
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 
     fn parameter_count(&self) -> usize {
         self.w_qkv.len() + self.w_o.len()
@@ -542,7 +574,11 @@ impl Layer for MultiHeadAttention {
             let i_c0 = i_h * i_hdim;
             let i_c1 = i_c0 + i_hdim;
             assert!(i_c1 <= m_grad_concat.ncols(), "grad concat slice OOB");
-            v_grad_ctx.push(m_grad_concat.slice_axis(Axis(1), Slice::from(i_c0..i_c1)).to_owned());
+            v_grad_ctx.push(
+                m_grad_concat
+                    .slice_axis(Axis(1), Slice::from(i_c0..i_c1))
+                    .to_owned(),
+            );
         }
 
         // Gradienten fuer Q, K, V
@@ -582,15 +618,18 @@ impl Layer for MultiHeadAttention {
 
             // In die Gesamtmatrizen zurueckschreiben
             {
-                let mut sl_q = m_grad_q.slice_axis_mut(Axis(1), Slice::from(i_h * i_hdim..(i_h + 1) * i_hdim));
+                let mut sl_q =
+                    m_grad_q.slice_axis_mut(Axis(1), Slice::from(i_h * i_hdim..(i_h + 1) * i_hdim));
                 sl_q.assign(&m_dq);
             }
             {
-                let mut sl_k = m_grad_k.slice_axis_mut(Axis(1), Slice::from(i_h * i_hdim..(i_h + 1) * i_hdim));
+                let mut sl_k =
+                    m_grad_k.slice_axis_mut(Axis(1), Slice::from(i_h * i_hdim..(i_h + 1) * i_hdim));
                 sl_k.assign(&m_dk);
             }
             {
-                let mut sl_v = m_grad_v.slice_axis_mut(Axis(1), Slice::from(i_h * i_hdim..(i_h + 1) * i_hdim));
+                let mut sl_v =
+                    m_grad_v.slice_axis_mut(Axis(1), Slice::from(i_h * i_hdim..(i_h + 1) * i_hdim));
                 sl_v.assign(&m_dv);
             }
         }
@@ -600,9 +639,18 @@ impl Layer for MultiHeadAttention {
 
         // W_qkv aufsplitten
         assert_eq!(self.w_qkv.ncols(), 3 * i_embed, "w_qkv cols mismatch");
-        let wq = self.w_qkv.slice_axis(Axis(1), Slice::from(0..i_embed)).to_owned();
-        let wk = self.w_qkv.slice_axis(Axis(1), Slice::from(i_embed..2 * i_embed)).to_owned();
-        let wv = self.w_qkv.slice_axis(Axis(1), Slice::from(2 * i_embed..3 * i_embed)).to_owned();
+        let wq = self
+            .w_qkv
+            .slice_axis(Axis(1), Slice::from(0..i_embed))
+            .to_owned();
+        let wk = self
+            .w_qkv
+            .slice_axis(Axis(1), Slice::from(i_embed..2 * i_embed))
+            .to_owned();
+        let wv = self
+            .w_qkv
+            .slice_axis(Axis(1), Slice::from(2 * i_embed..3 * i_embed))
+            .to_owned();
 
         // Gradienten fuer W_qkv
         let m_grad_w_q = m_x.t().dot(&m_grad_q);
@@ -611,7 +659,8 @@ impl Layer for MultiHeadAttention {
         let m_grad_w_qkv = concatenate(
             Axis(1),
             &[m_grad_w_q.view(), m_grad_w_k.view(), m_grad_w_v.view()],
-        ).expect("concat grad w_qkv failed");
+        )
+        .expect("concat grad w_qkv failed");
 
         // Grad fuer Input
         let m_grad_x = m_grad_q.dot(&wq.t()) + m_grad_k.dot(&wk.t()) + m_grad_v.dot(&wv.t());
@@ -635,9 +684,9 @@ impl Layer for MultiHeadAttention {
 #[derive(Serialize, Deserialize, Encode, Decode)]
 pub struct FeedForwardGeGLU {
     #[bincode(with_serde)]
-    pub w_in: Array2<f32>,   // [embed, 2*hidden] -> split in lin|gate
+    pub w_in: Array2<f32>, // [embed, 2*hidden] -> split in lin|gate
     #[bincode(with_serde)]
-    pub w_out: Array2<f32>,  // [hidden, embed]
+    pub w_out: Array2<f32>, // [hidden, embed]
     pub f_dropout: f32,
     pub f_decay: f32,
 
@@ -770,7 +819,9 @@ impl FeedForwardGeGLU {
         // Ruecknahme Dropout
         let mut m_grad_after_drop = grads.clone();
         if let Some(m_mask) = self.cached_dropout_mask.as_ref() {
-            Zip::from(&mut m_grad_after_drop).and(m_mask).for_each(|g, &m| *g = *g * m);
+            Zip::from(&mut m_grad_after_drop)
+                .and(m_mask)
+                .for_each(|g, &m| *g = *g * m);
         }
 
         // dW_out, dAct
@@ -862,10 +913,16 @@ impl OutputProjection {
 }
 
 impl Layer for OutputProjection {
-    fn layer_type(&self) -> &str { "OutputProjection" }
+    fn layer_type(&self) -> &str {
+        "OutputProjection"
+    }
 
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 
     fn parameter_count(&self) -> usize {
         self.w_out.len() + self.b_out.len()
@@ -937,10 +994,16 @@ impl TransformerBlockV2 {
 }
 
 impl Layer for TransformerBlockV2 {
-    fn layer_type(&self) -> &str { "TransformerBlockV2" }
+    fn layer_type(&self) -> &str {
+        "TransformerBlockV2"
+    }
 
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 
     fn parameter_count(&self) -> usize {
         self.norm1.parameter_count()
@@ -948,7 +1011,6 @@ impl Layer for TransformerBlockV2 {
             + self.norm2.parameter_count()
             + self.feedforward.parameter_count()
     }
-
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // Pre-Norm Attention
