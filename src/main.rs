@@ -5,14 +5,17 @@
 // Contact:  mschlieper@ylook.de | Tel 49 2338 8748862 | Mobil 49 15115751864
 // Address:  Epscheider Str21 58339 Breckerfeld
 // Note:     Entry point and CLI menu.
-//           Reintroduces two phase training: pretraining + main training.
+//           Adds corpus menu entry to fetch/prepare/filter/pack datasets.
 // History:
 //  - 2026-01-16: Restores two phase training menu flow with Enter defaults.
+//  - 2026-01-17: Adds corpus menu entry for corpus pipeline execution.
+//  - 2026-01-17: Updates corpus menu defaults to a valid http source URL.
 // ============================================================================
 
 #![forbid(unsafe_code)]
 #![allow(warnings)]
 
+mod corpus;
 mod layers;
 mod math;
 mod tokenize;
@@ -22,13 +25,16 @@ mod utils;
 use std::io::{self, Write};
 use std::path::Path;
 
+// NEW
+use crate::corpus::{Corpus, CorpusPackSpec, CorpusSourceSpec, CorpusSpec};
+use std::collections::HashMap;
+
 use crate::utils::MAX_SEQ_LEN_CANONICAL;
 use layers::{Embeddings, OutputProjection, TransformerBlockV2};
 use tokenize::Tokenizer;
 use train::{InferenceGrid, LLM, TrainConfig};
 use utils::{
-    DROPOUT, Dataset, DatasetType, EMBEDDING_DIM, HEADS, HIDDEN_DIM, LEARN_RATE_PRETRAIN,
-    LEARN_RATE_TRAIN,
+    DROPOUT, Dataset, DatasetType, EMBEDDING_DIM, HEADS, HIDDEN_DIM, LEARN_RATE_PRETRAIN, LEARN_RATE_TRAIN,
 };
 
 const S_CHECKPOINT_PATH: &str = "checkpoint.bin";
@@ -82,6 +88,94 @@ fn read_f32_default(s_prompt: &str, d_default: f32, d_min: f32, d_max: f32) -> i
     }
 }
 
+// NEW
+fn read_string_default(s_prompt: &str, s_default: &str) -> io::Result<String> {
+    loop {
+        print!("{} [{}]: ", s_prompt, s_default);
+        io::stdout().flush()?;
+        let s_in = read_line_trimmed()?;
+        if s_in.is_empty() {
+            return Ok(s_default.to_string());
+        }
+        if s_in.trim().is_empty() {
+            println!("Invalid input. Enter non empty string or press Enter.");
+            continue;
+        }
+        return Ok(s_in);
+    }
+}
+
+// NEW
+fn run_corpus_menu() -> io::Result<()> {
+    // Note:
+    // - This routine is intentionally conservative. It builds datasets using corpus.rs pipeline.
+    // - The operator defines URLs. The pipeline persists raw/prepared/filtered/packed artifacts under root_dir/corpora/*.
+    //
+    // History:
+    //  - 2026-01-17: Adds interactive corpus load/build workflow in CLI.
+    //  - 2026-01-17: Updates defaults to a valid http(s) text file to prevent url validation failures.
+
+    println!("===== CORPUS PIPELINE =====");
+    println!("This builds datasets via: fetch, prepare, filter, pack");
+    println!("Press Enter to accept defaults.");
+
+    // Root directory for corpora artifacts (default: data)
+    let s_root_dir = read_string_default("corpus_root_dir", "data")?;
+
+    // Defaults MUST be a valid http(s) URL for s_kind "http_file".
+    // Chosen: Project Gutenberg plain text (stable public domain example).
+    let s_source_id = read_string_default("source_id", "gutenberg_shakespeare_100")?;
+    let s_source_url = read_string_default(
+        "source_url",
+        "https://www.gutenberg.org/cache/epub/100/pg100.txt",
+    )?;
+    let s_source_filename = read_string_default("source_filename", "pg100.txt")?;
+
+    // Packing controls
+    let d_pretrain_ratio = read_f32_default("pretrain_ratio", 0.20, 0.0, 1.0)?;
+    let i_max_lines_total = read_usize_default("max_lines_total", 200000, 100, 100000000)?;
+    let i_min_line_len = read_usize_default("min_line_len", 40, 1, 100000)?;
+    let i_max_line_len = read_usize_default("max_line_len", 2000, 10, 200000)?;
+
+    let s_out_pretrain_json = read_string_default("out_pretrain_json", "pretraining_data_de.json")?;
+    let s_out_main_json = read_string_default("out_main_json", "chat_training_data_de.json")?;
+
+    let corpus = Corpus::new(s_root_dir);
+
+    let spec = CorpusSpec {
+        v_sources: vec![CorpusSourceSpec {
+            s_id: s_source_id,
+            s_kind: "http_file".to_string(),
+            s_url: s_source_url,
+            s_filename: s_source_filename,
+            m_params: HashMap::new(),
+        }],
+        pack: CorpusPackSpec {
+            s_out_pretrain_json,
+            s_out_main_json,
+            d_pretrain_ratio,
+            i_max_lines_total,
+            i_min_line_len,
+            i_max_line_len,
+        },
+    };
+
+    println!("CORPUS: fetch");
+    let manifest = corpus.corpus_fetch(&spec)?;
+
+    println!("CORPUS: prepare");
+    corpus.corpus_prepare(&spec, &manifest)?;
+
+    println!("CORPUS: filter");
+    corpus.corpus_filter(&spec)?;
+
+    println!("CORPUS: pack");
+    corpus.corpus_pack(&spec)?;
+
+    println!("CORPUS: done");
+    Ok(())
+}
+
 fn prepare_tokenizer_from_dataset(dataset: &Dataset, i_merge_limit: usize) -> Tokenizer {
     if Path::new(S_TOKENIZER_VOCAB_PATH).exists() && Path::new(S_TOKENIZER_MERGES_PATH).exists() {
         match Tokenizer::load(S_TOKENIZER_VOCAB_PATH, S_TOKENIZER_MERGES_PATH) {
@@ -95,10 +189,7 @@ fn prepare_tokenizer_from_dataset(dataset: &Dataset, i_merge_limit: usize) -> To
         }
     }
 
-    println!(
-        "Training tokenizer BPE with merge_limit={} ...",
-        i_merge_limit
-    );
+    println!("Training tokenizer BPE with merge_limit={} ...", i_merge_limit);
 
     let mut v_corpus: Vec<String> = Vec::new();
     v_corpus.extend(dataset.pretraining_data.iter().cloned());
@@ -162,7 +253,7 @@ fn default_cfg_pretrain() -> TrainConfig {
 
 fn default_cfg_main() -> TrainConfig {
     let mut cfg = TrainConfig::default_for_debug();
-    cfg.i_epochs = 10;
+    cfg.i_epochs = 100;
     cfg.i_steps_per_epoch = 300;
     cfg.i_batch_size = 16;
     cfg.d_val_ratio = 0.10;
@@ -179,8 +270,7 @@ fn menu_cfg_with_defaults(s_title: &str, cfg_in: &TrainConfig) -> io::Result<Tra
     let mut cfg = cfg_in.clone();
 
     cfg.i_epochs = read_usize_default("epochs", cfg.i_epochs, 1, 1000)?;
-    cfg.i_steps_per_epoch =
-        read_usize_default("steps_per_epoch", cfg.i_steps_per_epoch, 10, 100000)?;
+    cfg.i_steps_per_epoch = read_usize_default("steps_per_epoch", cfg.i_steps_per_epoch, 10, 100000)?;
     cfg.i_batch_size = read_usize_default("batch_size", cfg.i_batch_size, 1, 1024)?;
     cfg.d_val_ratio = read_f32_default("val_ratio", cfg.d_val_ratio, 0.0, 0.5)?;
     cfg.d_lr = read_f32_default("learn_rate", cfg.d_lr, 1e-6, 1.0)?;
@@ -192,8 +282,6 @@ fn menu_cfg_with_defaults(s_title: &str, cfg_in: &TrainConfig) -> io::Result<Tra
     }
 
     cfg.i_max_seq_len = read_usize_default("max_seq_len", 256, 32, MAX_SEQ_LEN_CANONICAL)?;
-
-    
 
     Ok(cfg)
 }
@@ -207,6 +295,7 @@ fn run_menu(mut llm: LLM, dataset: Dataset) -> io::Result<()> {
         println!("  t - train (pretraining + main training)");
         println!("  b - ask model (interactive)");
         println!("  g - inference grid on fixed prompts");
+        println!("  c - corpus pipeline (fetch + prepare + filter + pack)");
         println!("  e - exit");
         print!("choice: ");
         io::stdout().flush()?;
@@ -223,10 +312,8 @@ fn run_menu(mut llm: LLM, dataset: Dataset) -> io::Result<()> {
                 Err(e) => println!("Save failed: {}", e),
             },
             "t" => {
-                let cfg_pre =
-                    menu_cfg_with_defaults("PHASE A: pretraining config", &default_cfg_pretrain())?;
-                let cfg_main =
-                    menu_cfg_with_defaults("PHASE B: main training config", &default_cfg_main())?;
+                let cfg_pre = menu_cfg_with_defaults("PHASE A: pretraining config", &default_cfg_pretrain())?;
+                let cfg_main = menu_cfg_with_defaults("PHASE B: main training config", &default_cfg_main())?;
 
                 let v_pretrain = dataset.pretraining_data.clone();
                 let v_main = dataset.chat_training_data.clone();
@@ -262,15 +349,16 @@ fn run_menu(mut llm: LLM, dataset: Dataset) -> io::Result<()> {
             "g" => {
                 let grid = InferenceGrid::conservative_default();
                 let v_prompts: Vec<String> = vec![
-                    "User: Erklaere kurz den Unterschied zwischen TCP und UDP. Assistant: "
-                        .to_string(),
-                    "User: Schreibe eine kurze E Mail zur Terminbestaetigung. Assistant: "
-                        .to_string(),
-                    "User: Nenne drei Vorteile von Rust gegenueber C plus plus. Assistant: "
-                        .to_string(),
+                    "User: Erklaere kurz den Unterschied zwischen TCP und UDP. Assistant: ".to_string(),
+                    "User: Schreibe eine kurze E Mail zur Terminbestaetigung. Assistant: ".to_string(),
+                    "User: Nenne drei Vorteile von Rust gegenueber C plus plus. Assistant: ".to_string(),
                 ];
                 llm.run_inference_grid(&v_prompts, &grid);
             }
+            "c" => match run_corpus_menu() {
+                Ok(_) => println!("Corpus pipeline finished."),
+                Err(e) => println!("Corpus pipeline failed: {}", e),
+            },
             "e" => {
                 println!("Exiting.");
                 break;

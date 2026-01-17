@@ -4,24 +4,10 @@
 // Company:  ExpChat.ai
 // Contact:  mschlieper@ylook.de | Tel 49 2338 8748862 | Mobil 49 15115751864
 // Address:  Epscheider Str21 58339 Breckerfeld
-// Note:     LLM orchestration: network, training, inference, and checkpoints.
-//           This module enforces a canonical context length via
-//           MAX_SEQ_LEN_CANONICAL and prevents runtime crashes by applying
-//           strict context windowing in both training and inference.
-//           It also validates checkpoint compatibility with respect to
-//           positional embedding length.
-//
-//           Features:
-//           - Two phase training: pretraining + main training (instruction tuning)
-//           - Random window sampling with strict bounds (no overlap chunking)
-//           - Validation loss and top1 accuracy
-//           - Inference with greedy baseline and top-k + top-p sampling
-//           - Eval mode disables dropout (best effort)
-//           - Checkpoint load validates positional embedding rows
-//
+// Note:     Integrates GradScaler and stable softmax, plus train/eval mode gating
+//           for dropout and stochastic depth.
 // History:
-//  - 2026-01-16: Initial consolidated version with canonical context length,
-//                checkpoint validation, and two phase training workflow.
+//  - 2026-01-17: Add gradient scaling and train/eval propagation.
 // ============================================================================
 
 #![forbid(unsafe_code)]
@@ -29,7 +15,6 @@
 use anyhow::{anyhow, Context, Result};
 use bincode::{config, decode_from_std_read, encode_into_std_write};
 use ndarray::{Array2, Axis};
-use rand::Rng;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -37,13 +22,9 @@ use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
 
 use crate::layers::{Embeddings, Layer, OutputProjection, TransformerBlockV2};
-use crate::math::{clip_gradients, compute_gradients_step, cross_entropy_loss_step, softmax};
+use crate::math::{clip_gradients, compute_gradients_step, cross_entropy_loss_step, softmax_stable, GradScaler};
 use crate::tokenize::Tokenizer;
 use crate::utils::MAX_SEQ_LEN_CANONICAL;
-
-// ----------------------------------------------------------------------------
-// Public configuration structs
-// ----------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 pub struct SamplingParams {
@@ -92,21 +73,25 @@ impl InferenceGrid {
 
 #[derive(Clone, Debug)]
 pub struct TrainConfig {
-    // Context and random window parameters
     pub i_max_seq_len: usize,
     pub i_min_window_len: usize,
 
-    // Optimization
     pub d_lr: f32,
     pub i_batch_size: usize,
     pub d_grad_clip: f32,
 
-    // Train/val setup
     pub d_val_ratio: f32,
 
-    // Workload
     pub i_epochs: usize,
     pub i_steps_per_epoch: usize,
+
+    // Regularization controls
+    pub d_attention_dropout: f32,
+    pub d_residual_dropout: f32,
+    pub d_stochastic_depth_p: f32,
+
+    // Mixed precision style controls
+    pub b_grad_scaling: bool,
 }
 
 impl TrainConfig {
@@ -120,11 +105,14 @@ impl TrainConfig {
             d_val_ratio: 0.10,
             i_epochs: 10,
             i_steps_per_epoch: 200,
+            d_attention_dropout: 0.1,
+            d_residual_dropout: 0.0,
+            d_stochastic_depth_p: 0.0,
+            b_grad_scaling: true,
         }
     }
 
     pub fn sanitize(&mut self) {
-        // Never exceed canonical context length
         if self.i_max_seq_len > MAX_SEQ_LEN_CANONICAL {
             self.i_max_seq_len = MAX_SEQ_LEN_CANONICAL;
         }
@@ -132,38 +120,25 @@ impl TrainConfig {
             self.i_max_seq_len = 8;
         }
 
-        if self.i_min_window_len < 2 {
-            self.i_min_window_len = 2;
-        }
-        if self.i_min_window_len > self.i_max_seq_len {
-            self.i_min_window_len = self.i_max_seq_len;
-        }
-
-        if self.i_batch_size < 1 {
-            self.i_batch_size = 1;
-        }
+        self.i_min_window_len = self.i_min_window_len.clamp(2, self.i_max_seq_len);
+        self.i_batch_size = self.i_batch_size.max(1);
 
         self.d_val_ratio = self.d_val_ratio.clamp(0.0, 0.5);
-        if self.i_epochs < 1 {
-            self.i_epochs = 1;
-        }
-        if self.i_steps_per_epoch < 1 {
-            self.i_steps_per_epoch = 1;
-        }
+        self.i_epochs = self.i_epochs.max(1);
+        self.i_steps_per_epoch = self.i_steps_per_epoch.max(1);
 
-        // Defensive clamps; domain experts may override intentionally.
         if !self.d_lr.is_finite() || self.d_lr <= 0.0 {
             self.d_lr = 1e-4;
         }
         if !self.d_grad_clip.is_finite() || self.d_grad_clip <= 0.0 {
             self.d_grad_clip = 1.0;
         }
+
+        self.d_attention_dropout = self.d_attention_dropout.clamp(0.0, 0.9);
+        self.d_residual_dropout = self.d_residual_dropout.clamp(0.0, 0.9);
+        self.d_stochastic_depth_p = self.d_stochastic_depth_p.clamp(0.0, 0.9);
     }
 }
-
-// ----------------------------------------------------------------------------
-// LLM object
-// ----------------------------------------------------------------------------
 
 pub struct LLM {
     pub tokenizer: Tokenizer,
@@ -179,7 +154,6 @@ impl LLM {
             "last layer must be OutputProjection"
         );
 
-        // Runtime max must never exceed canonical positional capacity.
         let i_max = i_max_seq_len_runtime.min(MAX_SEQ_LEN_CANONICAL).max(8);
 
         Self {
@@ -189,30 +163,67 @@ impl LLM {
         }
     }
 
+    // History:
+    //  - 2026-01-17: Restores textual network description used by CLI.
     pub fn network_description(&self) -> String {
         self.network
             .iter()
             .map(|l| l.layer_type())
-            .collect::<Vec<_>>()
+            .collect::<Vec<&str>>()
             .join(", ")
     }
 
+    // History:
+    //  - 2026-01-17: Restores parameter counting used by CLI model info.
     pub fn total_parameters(&self) -> usize {
         self.network.iter().map(|l| l.parameter_count()).sum()
     }
 
-    // ------------------------------------------------------------------------
-    // Mode control
-    // ------------------------------------------------------------------------
+    // History:
+    //  - 2026-01-17: Restores inference grid runner used by CLI.
+    pub fn run_inference_grid(&mut self, v_prompts: &[String], grid: &InferenceGrid) {
+        // Inference must run without dropout and stochastic depth.
+        self.set_eval_mode_no_dropout();
 
-    // Best effort: disables dropout for inference by setting relevant fields
-    // in known layer types. Unknown layers remain unchanged.
+        for s_prompt in v_prompts {
+            println!("PROMPT: {}", s_prompt);
+
+            println!("GREEDY:");
+            let _ = self.predict_greedy(s_prompt);
+
+            for &d_temp in &grid.v_temperatures {
+                for &i_k in &grid.v_k_top {
+                    for &d_p in &grid.v_p_top {
+                        let params = SamplingParams {
+                            d_temperature: d_temp,
+                            i_k_top: i_k,
+                            d_p_top: d_p,
+                            b_greedy: false,
+                        };
+
+                        println!(
+                            "SAMPLE: temp={:.2} k_top={} p_top={:.2}",
+                            d_temp, i_k, d_p
+                        );
+
+                        let _ = self.generate(s_prompt, &params, true);
+                    }
+                }
+            }
+
+            println!("");
+        }
+    }
+    
     pub fn set_eval_mode_no_dropout(&mut self) {
+        self.set_train_mode(false);
+    }
+
+    pub fn set_train_mode(&mut self, b_train: bool) {
         for layer in &mut self.network {
             let any = layer.as_any_mut();
             if let Some(block) = any.downcast_mut::<TransformerBlockV2>() {
-                block.attention.f_dropout = 0.0;
-                block.feedforward.f_dropout = 0.0;
+                block.set_train_mode(b_train);
             }
         }
     }
@@ -231,9 +242,14 @@ impl LLM {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Inference API
-    // ------------------------------------------------------------------------
+    pub fn apply_regularization_cfg(&mut self, cfg: &TrainConfig) {
+        for layer in &mut self.network {
+            let any = layer.as_any_mut();
+            if let Some(block) = any.downcast_mut::<TransformerBlockV2>() {
+                block.set_regularization(cfg.d_attention_dropout, cfg.d_residual_dropout, cfg.d_stochastic_depth_p);
+            }
+        }
+    }
 
     pub fn predict(&mut self, s_input: &str) -> String {
         self.set_eval_mode_no_dropout();
@@ -249,47 +265,12 @@ impl LLM {
         self.tokenizer.decode_tokens(&v_ids)
     }
 
-    pub fn run_inference_grid(&mut self, v_prompts: &[String], grid: &InferenceGrid) {
-        self.set_eval_mode_no_dropout();
-
-        for s_prompt in v_prompts {
-            println!("PROMPT: {}", s_prompt);
-            println!("GREEDY:");
-            let _ = self.predict_greedy(s_prompt);
-
-            for &d_temp in &grid.v_temperatures {
-                for &i_k in &grid.v_k_top {
-                    for &d_p in &grid.v_p_top {
-                        let params = SamplingParams {
-                            d_temperature: d_temp,
-                            i_k_top: i_k,
-                            d_p_top: d_p,
-                            b_greedy: false,
-                        };
-                        println!("SAMPLE: temp={:.2} k_top={} p_top={:.2}", d_temp, i_k, d_p);
-                        let _ = self.generate(s_prompt, &params, true);
-                    }
-                }
-            }
-            println!("");
-        }
-    }
-
-    // ------------------------------------------------------------------------
-    // generate: hard windowing to prevent crashes
-    // ------------------------------------------------------------------------
-
-    // History:
-    //  - 2026-01-16: Enforces MAX_SEQ_LEN_CANONICAL hard cap to avoid positional
-    //               embedding out of bounds. Uses last tokens (left truncation).
     fn generate(&mut self, s_input: &str, params: &SamplingParams, b_stream: bool) -> Vec<usize> {
         let mut v_context: Vec<usize> = self.tokenizer.encode_text(s_input);
         let i_eos = self.tokenizer.eos_id();
 
-        // Hard cap against canonical length and runtime length.
         let i_cap = self.i_max_seq_len_runtime.min(MAX_SEQ_LEN_CANONICAL);
 
-        // Keep last i_cap - 1 tokens to allow at least one generation step.
         if v_context.len() >= i_cap {
             let i_keep = i_cap.saturating_sub(1).max(1);
             v_context = v_context[v_context.len().saturating_sub(i_keep)..].to_vec();
@@ -303,7 +284,6 @@ impl LLM {
                 break;
             }
 
-            // Forward pass input shape: [1, seq]
             let a_input = Array2::from_shape_vec(
                 (1, v_context.len()),
                 v_context.iter().map(|&id| id as f32).collect(),
@@ -319,11 +299,11 @@ impl LLM {
                 break;
             }
 
-            // Use last timestep logits
             let i_last_row = a_activ.nrows() - 1;
             let a_last = a_activ.row(i_last_row).to_owned().insert_axis(Axis(0));
 
-            let mut a_probs = softmax(&a_last);
+            // keep existing sampling logic; uses stable softmax for logits -> probs
+            let mut a_probs = softmax_stable(&a_last);
 
             let i_next = if params.b_greedy {
                 argmax_row0(&a_probs)
@@ -339,7 +319,6 @@ impl LLM {
             v_context.push(i_next);
             v_out.push(i_next);
 
-            // Maintain hard cap while generating.
             if v_context.len() >= i_cap {
                 let i_keep = i_cap.saturating_sub(1).max(1);
                 v_context = v_context[v_context.len().saturating_sub(i_keep)..].to_vec();
@@ -359,19 +338,7 @@ impl LLM {
         v_out
     }
 
-    // ------------------------------------------------------------------------
-    // Two phase training
-    // ------------------------------------------------------------------------
-
-    // History:
-    //  - 2026-01-16: Restores original workflow: pretraining then instruction tuning.
-    pub fn train_two_phase(
-        &mut self,
-        v_pretrain_texts: &[String],
-        v_main_texts: &[String],
-        cfg_pretrain: &TrainConfig,
-        cfg_main: &TrainConfig,
-    ) {
+    pub fn train_two_phase(&mut self, v_pretrain_texts: &[String], v_main_texts: &[String], cfg_pretrain: &TrainConfig, cfg_main: &TrainConfig) {
         println!("PHASE A: pretraining");
         self.train_with_validation(v_pretrain_texts, cfg_pretrain);
 
@@ -383,13 +350,13 @@ impl LLM {
         let mut cfg = cfg_in.clone();
         cfg.sanitize();
 
-        // Enforce runtime cap to canonical.
         self.i_max_seq_len_runtime = cfg.i_max_seq_len.min(MAX_SEQ_LEN_CANONICAL).max(8);
-
-        // Batch accumulation on optimizer side.
         self.set_batch_accumulation(cfg.i_batch_size);
+        self.apply_regularization_cfg(&cfg);
+        self.set_train_mode(true);
 
-        // Ctrl+C stop.
+        let mut grad_scaler = GradScaler::new_default();
+
         let stop_flag = Arc::new(AtomicBool::new(false));
         {
             let stop_flag_ctrlc = Arc::clone(&stop_flag);
@@ -398,24 +365,23 @@ impl LLM {
             });
         }
 
-        // Train/val split before tokenization.
         let (v_train_texts, v_val_texts) = split_train_val(v_texts, cfg.d_val_ratio);
 
-        // Tokenize.
-        let v_train_tok: Vec<Vec<usize>> = v_train_texts
-            .iter()
-            .map(|s| self.tokenizer.encode_text(s))
-            .collect();
+        let v_train_tok: Vec<Vec<usize>> = v_train_texts.iter().map(|s| self.tokenizer.encode_text(s)).collect();
         let v_val_tok: Vec<Vec<usize>> = v_val_texts.iter().map(|s| self.tokenizer.encode_text(s)).collect();
 
         println!(
-            "TRAIN: samples={} VAL: samples={} max_seq_len={} lr={:.8} steps_per_epoch={} batch_size={}",
+            "TRAIN: samples={} VAL: samples={} max_seq_len={} lr={:.8} steps_per_epoch={} batch_size={} attn_do={:.3} res_do={:.3} sd_p={:.3} grad_scaling={}",
             v_train_tok.len(),
             v_val_tok.len(),
             cfg.i_max_seq_len,
             cfg.d_lr,
             cfg.i_steps_per_epoch,
-            cfg.i_batch_size
+            cfg.i_batch_size,
+            cfg.d_attention_dropout,
+            cfg.d_residual_dropout,
+            cfg.d_stochastic_depth_p,
+            cfg.b_grad_scaling
         );
 
         for i_epoch in 0..cfg.i_epochs {
@@ -428,8 +394,6 @@ impl LLM {
             let mut d_loss_sum: f32 = 0.0;
             let mut i_steps: usize = 0;
             let mut i_tokens: usize = 0;
-            let mut i_top1_hits: usize = 0;
-            let mut i_top1_total: usize = 0;
 
             for _ in 0..cfg.i_steps_per_epoch {
                 if stop_flag.load(AtomicOrdering::Relaxed) {
@@ -450,19 +414,31 @@ impl LLM {
                     a_forward = layer.forward(&a_forward);
                 }
 
-                // Expect [seq, vocab] where seq == target length.
                 if a_forward.nrows() != v_tgt.len() {
                     continue;
                 }
 
-                let a_probs = softmax(&a_forward);
+                let a_probs = softmax_stable(&a_forward);
                 d_loss_sum += cross_entropy_loss_step(&a_probs, &v_tgt);
 
-                let (hits, total) = top1_hits(&a_probs, &v_tgt);
-                i_top1_hits += hits;
-                i_top1_total += total;
-
                 let mut a_grads = compute_gradients_step(&a_probs, &v_tgt);
+
+                // Mixed precision style: scale grads before clipping and backward,
+                // then unscale before optimizer step inside layers via AdamW.
+                // Since optimizers are inside layers, we unscale before calling backward.
+                if cfg.b_grad_scaling {
+                    grad_scaler.scale_grads_inplace(&mut a_grads);
+                }
+
+                if cfg.b_grad_scaling && !GradScaler::grads_are_finite(&a_grads) {
+                    grad_scaler.update(true);
+                    continue;
+                }
+
+                if cfg.b_grad_scaling {
+                    grad_scaler.unscale_grads_inplace(&mut a_grads);
+                }
+
                 clip_gradients(&mut a_grads, cfg.d_grad_clip);
 
                 for layer in self.network.iter_mut().rev() {
@@ -471,28 +447,28 @@ impl LLM {
 
                 i_steps += 1;
                 i_tokens += v_tgt.len();
+
+                if cfg.b_grad_scaling {
+                    grad_scaler.update(false);
+                }
             }
 
-            let d_train_loss = if i_steps > 0 { d_loss_sum / (i_steps as f32) } else { 0.0 };
-            let d_train_acc = if i_top1_total > 0 { (i_top1_hits as f32) / (i_top1_total as f32) } else { 0.0 };
-
-            // Validation in eval mode (dropout off best effort).
             self.set_eval_mode_no_dropout();
             let (d_val_loss, d_val_acc) = evaluate_validation(self, &v_val_tok, &cfg);
 
+            let d_train_loss = if i_steps > 0 { d_loss_sum / (i_steps as f32) } else { 0.0 };
             let d_secs = t_start.elapsed().as_secs_f32().max(1e-6);
             let d_tps = (i_tokens as f32) / d_secs;
 
             println!(
-                "Epoch {} train_loss {:.4} train_acc {:.4} val_loss {:.4} val_acc {:.4} tokens_s {:.0} steps {}",
-                i_epoch, d_train_loss, d_train_acc, d_val_loss, d_val_acc, d_tps, i_steps
+                "Epoch {} train_loss {:.4} val_loss {:.4} val_acc {:.4} tokens_s {:.0} steps {}",
+                i_epoch, d_train_loss, d_val_loss, d_val_acc, d_tps, i_steps
             );
+
+            // restore train mode for next epoch
+            self.set_train_mode(true);
         }
     }
-
-    // ------------------------------------------------------------------------
-    // Checkpoints with compatibility validation
-    // ------------------------------------------------------------------------
 
     pub fn save_checkpoint(&mut self, s_path: &str) -> Result<()> {
         let f = File::create(s_path).with_context(|| format!("cannot create file: {}", s_path))?;
@@ -517,8 +493,6 @@ impl LLM {
         Ok(())
     }
 
-    // History:
-    //  - 2026-01-16: Validates positional embedding rows against MAX_SEQ_LEN_CANONICAL.
     pub fn load_checkpoint(&mut self, s_path: &str) -> Result<()> {
         use std::io::ErrorKind;
 
@@ -539,16 +513,10 @@ impl LLM {
 
             if any.is::<Embeddings>() {
                 let loaded: Embeddings = decode_from_std_read(&mut r, cfg)?;
-
                 let i_rows = loaded.positional_embeddings.nrows();
                 if i_rows != MAX_SEQ_LEN_CANONICAL {
-                    return Err(anyhow!(
-                        "checkpoint incompatible: positional_embeddings rows {} != MAX_SEQ_LEN_CANONICAL {}. action: delete or migrate checkpoint",
-                        i_rows,
-                        MAX_SEQ_LEN_CANONICAL
-                    ));
+                    return Err(anyhow!("checkpoint incompatible: positional_embeddings rows mismatch"));
                 }
-
                 *any.downcast_mut::<Embeddings>().unwrap() = loaded;
             } else if any.is::<TransformerBlockV2>() {
                 *any.downcast_mut::<TransformerBlockV2>().unwrap() = decode_from_std_read(&mut r, cfg)?;
@@ -564,9 +532,7 @@ impl LLM {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Validation and metrics helpers
-// ----------------------------------------------------------------------------
+// ---------------- Validation helpers (use stable softmax) ----------------
 
 fn evaluate_validation(llm: &mut LLM, v_val_tok: &[Vec<usize>], cfg: &TrainConfig) -> (f32, f32) {
     if v_val_tok.is_empty() {
@@ -578,7 +544,6 @@ fn evaluate_validation(llm: &mut LLM, v_val_tok: &[Vec<usize>], cfg: &TrainConfi
     let mut i_top1_hits: usize = 0;
     let mut i_top1_total: usize = 0;
 
-    // Keep validation bounded; use stable but limited workload.
     let i_eval_steps = (cfg.i_steps_per_epoch / 4).max(50);
 
     for _ in 0..i_eval_steps {
@@ -599,7 +564,7 @@ fn evaluate_validation(llm: &mut LLM, v_val_tok: &[Vec<usize>], cfg: &TrainConfi
             continue;
         }
 
-        let a_probs = softmax(&a_forward);
+        let a_probs = softmax_stable(&a_forward);
         d_loss_sum += cross_entropy_loss_step(&a_probs, &v_tgt);
 
         let (hits, total) = top1_hits(&a_probs, &v_tgt);
@@ -611,7 +576,6 @@ fn evaluate_validation(llm: &mut LLM, v_val_tok: &[Vec<usize>], cfg: &TrainConfi
 
     let d_loss = if i_steps > 0 { d_loss_sum / (i_steps as f32) } else { 0.0 };
     let d_acc = if i_top1_total > 0 { (i_top1_hits as f32) / (i_top1_total as f32) } else { 0.0 };
-
     (d_loss, d_acc)
 }
 
@@ -642,94 +606,20 @@ fn top1_hits(a_probs: &Array2<f32>, v_targets: &[usize]) -> (usize, usize) {
     (hits, i_tgt_len)
 }
 
-// ----------------------------------------------------------------------------
-// Train/val split and random window sampling
-// ----------------------------------------------------------------------------
-
-fn split_train_val(v_texts: &[String], d_val_ratio: f32) -> (Vec<String>, Vec<String>) {
-    let d = d_val_ratio.clamp(0.0, 0.5);
-    let n = v_texts.len();
-    if n == 0 {
-        return (Vec::new(), Vec::new());
-    }
-
-    let i_val = ((n as f32) * d).round() as usize;
-    let i_val = i_val.min(n);
-    let i_train = n - i_val;
-
-    // Deterministic split (last part as validation).
-    (v_texts[..i_train].to_vec(), v_texts[i_train..].to_vec())
-}
-
-fn sample_random_window_pair(
-    v_sequences: &[Vec<usize>],
-    i_max_seq_len_requested: usize,
-    i_min_window_len: usize,
-) -> (Vec<usize>, Vec<usize>) {
-    use rand::Rng;
-
-    if v_sequences.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-
-    let mut rng = rand::thread_rng();
-    let i_seq_idx = rng.gen_range(0..v_sequences.len());
-    let v_seq = &v_sequences[i_seq_idx];
-
-    if v_seq.len() < 2 {
-        return (Vec::new(), Vec::new());
-    }
-
-    // Hard cap to canonical.
-    let i_max_seq_len = i_max_seq_len_requested.min(MAX_SEQ_LEN_CANONICAL).max(2);
-
-    let i_max_len_eff = i_max_seq_len.min(v_seq.len());
-    let i_min_len_eff = i_min_window_len.clamp(2, i_max_len_eff);
-
-    let i_win_len = if i_min_len_eff >= i_max_len_eff {
-        i_max_len_eff
-    } else {
-        rng.gen_range(i_min_len_eff..=i_max_len_eff)
-    };
-
-    let i_start_max = v_seq.len().saturating_sub(i_win_len);
-    let i_start = if i_start_max == 0 { 0 } else { rng.gen_range(0..=i_start_max) };
-
-    let i_end = i_start + i_win_len;
-    if i_end > v_seq.len() {
-        // Defensive fallback, should be unreachable.
-        return (Vec::new(), Vec::new());
-    }
-
-    let v_window = &v_seq[i_start..i_end];
-    if v_window.len() < 2 {
-        return (Vec::new(), Vec::new());
-    }
-
-    let v_in = v_window[..v_window.len() - 1].to_vec();
-    let v_tgt = v_window[1..].to_vec();
-    (v_in, v_tgt)
-}
-
-// ----------------------------------------------------------------------------
-// Sampling helpers
-// ----------------------------------------------------------------------------
+// ---------------- Sampling helpers (unchanged) ----------------
 
 fn argmax_row0(a_probs_1xv: &Array2<f32>) -> usize {
     if a_probs_1xv.nrows() != 1 || a_probs_1xv.ncols() == 0 {
         return 0;
     }
-
     let mut best_i: usize = 0;
     let mut best_v: f32 = f32::NEG_INFINITY;
-
     for (i, &p) in a_probs_1xv.row(0).iter().enumerate() {
         if p > best_v {
             best_v = p;
             best_i = i;
         }
     }
-
     best_i
 }
 
@@ -738,8 +628,6 @@ fn apply_temperature_inplace(a_probs_1xv: &mut Array2<f32>, d_temperature: f32) 
     if (d_temp - 1.0).abs() <= 1e-6 {
         return;
     }
-
-    // p_i' = p_i^(1/temp) / sum(...)
     let d_inv = 1.0 / d_temp;
     let mut d_sum: f32 = 0.0;
 
@@ -775,7 +663,6 @@ fn sample_k_top_p_top(a_probs_1xv: &Array2<f32>, i_k_top: usize, d_p_top: f32) -
 
     v_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Top-k (k==0 => no filter)
     let mut v_filtered: Vec<(usize, f32)> = if i_k_top == 0 {
         v_pairs
     } else {
@@ -784,13 +671,10 @@ fn sample_k_top_p_top(a_probs_1xv: &Array2<f32>, i_k_top: usize, d_p_top: f32) -
     };
 
     let d_p = d_p_top.clamp(0.0, 1.0);
-
-    // p<=0 => greedy fallback for deterministic behavior.
     if d_p <= 0.0 {
         return v_filtered.get(0).map(|x| x.0).unwrap_or(0);
     }
 
-    // Nucleus if p<1.0
     if d_p < 1.0 {
         let mut d_cum: f32 = 0.0;
         let mut v_nucleus: Vec<(usize, f32)> = Vec::new();
@@ -801,7 +685,6 @@ fn sample_k_top_p_top(a_probs_1xv: &Array2<f32>, i_k_top: usize, d_p_top: f32) -
             }
             v_nucleus.push((i, p));
             d_cum += p;
-
             if d_cum >= d_p && !v_nucleus.is_empty() {
                 break;
             }
@@ -821,7 +704,6 @@ fn sample_k_top_p_top(a_probs_1xv: &Array2<f32>, i_k_top: usize, d_p_top: f32) -
         return v_filtered.get(0).map(|x| x.0).unwrap_or(0);
     }
 
-    // rand 0.9 safe API
     let mut rng = rand::thread_rng();
     let mut r = rng.gen_range(0.0..sum);
 
@@ -833,4 +715,63 @@ fn sample_k_top_p_top(a_probs_1xv: &Array2<f32>, i_k_top: usize, d_p_top: f32) -
     }
 
     0
+}
+
+// ---------------- Train/val split and window sampling (unchanged) ----------------
+
+fn split_train_val(v_texts: &[String], d_val_ratio: f32) -> (Vec<String>, Vec<String>) {
+    let d = d_val_ratio.clamp(0.0, 0.5);
+    let n = v_texts.len();
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let i_val = ((n as f32) * d).round() as usize;
+    let i_val = i_val.min(n);
+    let i_train = n - i_val;
+
+    (v_texts[..i_train].to_vec(), v_texts[i_train..].to_vec())
+}
+
+fn sample_random_window_pair(v_sequences: &[Vec<usize>], i_max_seq_len_requested: usize, i_min_window_len: usize) -> (Vec<usize>, Vec<usize>) {
+    use rand::Rng;
+
+    if v_sequences.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut rng = rand::thread_rng();
+    let i_seq_idx = rng.gen_range(0..v_sequences.len());
+    let v_seq = &v_sequences[i_seq_idx];
+
+    if v_seq.len() < 2 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let i_max_seq_len = i_max_seq_len_requested.min(MAX_SEQ_LEN_CANONICAL).max(2);
+    let i_max_len_eff = i_max_seq_len.min(v_seq.len());
+    let i_min_len_eff = i_min_window_len.clamp(2, i_max_len_eff);
+
+    let i_win_len = if i_min_len_eff >= i_max_len_eff {
+        i_max_len_eff
+    } else {
+        rng.gen_range(i_min_len_eff..=i_max_len_eff)
+    };
+
+    let i_start_max = v_seq.len().saturating_sub(i_win_len);
+    let i_start = if i_start_max == 0 { 0 } else { rng.gen_range(0..=i_start_max) };
+
+    let i_end = i_start + i_win_len;
+    if i_end > v_seq.len() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let v_window = &v_seq[i_start..i_end];
+    if v_window.len() < 2 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let v_in = v_window[..v_window.len() - 1].to_vec();
+    let v_tgt = v_window[1..].to_vec();
+    (v_in, v_tgt)
 }
