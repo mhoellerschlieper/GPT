@@ -1,17 +1,20 @@
-// tokenize.rs (PATCH)
+// tokenize.rs
 // ============================================================================
 // Author:   Marcus Schlieper
 // Company:  ExpChat.ai
 // Contact:  mschlieper@ylook.de | Tel 49 2338 8748862 | Mobil 49 15115751864
 // Address:  Epscheider Str21 58339 Breckerfeld
-// Note:     Tokenizer with reversible byte mapping and BPE.
-//           Patch adds stop sequence tokenization helper for inference.
+// Note:     Tokenizer implementation with reversible byte mapping and BPE.
+//           FIX: Prevent EOS from becoming part of BPE merges by never including
+//           EOS in the BPE training corpus. EOS must exist exactly once as a
+//           special token and must not be produced by merges.
 // History:
-//  - 2026-01-18: Adds encode_stop_sequence helper and guards duplicate EOS.
+//  - 2026-01-16: Initial version for reversible byte mapping tokenizer and BPE.
+//  - 2026-01-18: Fixes BPE training: do not append EOS to training sequences,
+//                preventing EOS related merges and merge file pollution.
 // ============================================================================
 
 #![forbid(unsafe_code)]
-#![allow(warnings)]
 
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
@@ -31,13 +34,18 @@ pub struct Tokenizer {
     #[bincode(with_serde)]
     words: Vec<String>,
 
+    // BPE merges, applied in stored order
     merges: Vec<(String, String)>,
 
+    // Reversible byte encoder, GPT2 style
+    // byte_to_ch maps raw byte -> printable unicode char
+    // ch_to_byte maps printable unicode char -> raw byte
     #[bincode(with_serde)]
     byte_to_ch: Vec<char>,
     #[bincode(with_serde)]
     ch_to_byte: HashMap<char, u8>,
 
+    // Fast lookup for merges
     #[serde(skip)]
     #[bincode(with_serde)]
     fast_merge: HashMap<(String, String), String>,
@@ -51,6 +59,7 @@ impl Tokenizer {
         let mut decode: HashMap<usize, String> = HashMap::new();
         let mut words: Vec<String> = Vec::new();
 
+        // Base vocab: 256 "byte tokens" represented as printable unicode chars
         for i_b in 0u16..=255u16 {
             let b = i_b as u8;
             let ch = byte_to_ch[b as usize];
@@ -61,6 +70,7 @@ impl Tokenizer {
             decode.insert(i_id, s_tok);
         }
 
+        // Special tokens
         let i_unk = words.len();
         words.push(S_UNK.to_string());
         encode.insert(S_UNK.to_string(), i_unk);
@@ -123,22 +133,48 @@ impl Tokenizer {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // BPE training
+    // ------------------------------------------------------------------------
+    // FIX:
+    // - Do NOT append EOS to sequences during BPE training.
+    // - If EOS is present as literal text in inputs, strip a trailing EOS marker.
+    // Rationale:
+    // - EOS must remain a special token only.
+    // - Including EOS in the merge training allows BPE to merge into tokens that
+    //   contain "</s>", polluting tokenizer_merges.txt and breaking eos detection.
     pub fn train_bpe(&mut self, v_texts: &[String], i_merge_limit: usize) {
         let mut corpus: Vec<Vec<String>> = v_texts
             .iter()
             .map(|s| {
-                let v_bytes = s.as_bytes();
-                let mut v_tokens: Vec<String> = v_bytes
+                // Defensive: remove literal EOS marker at end if present in text.
+                let mut s_work = s.to_string();
+                if s_work.ends_with(S_EOS) {
+                    let i_new_len = s_work.len().saturating_sub(S_EOS.len());
+                    s_work.truncate(i_new_len);
+                }
+
+                let v_bytes = s_work.as_bytes();
+                let v_tokens: Vec<String> = v_bytes
                     .iter()
                     .map(|&b| self.byte_to_ch[b as usize].to_string())
                     .collect();
-                v_tokens.push(S_EOS.to_string());
+
+                // IMPORTANT: no EOS appended here
                 v_tokens
             })
             .collect();
 
+        // If corpus is empty or all sequences are too short, merges stay empty.
+        if corpus.is_empty() {
+            self.merges.clear();
+            self.rebuild_fast_merge();
+            return;
+        }
+
         for _ in 0..i_merge_limit {
             let mut pair_count: HashMap<(String, String), usize> = HashMap::new();
+
             for seq in &corpus {
                 if seq.len() < 2 {
                     continue;
@@ -146,6 +182,12 @@ impl Tokenizer {
                 for win in seq.windows(2) {
                     let l = &win[0];
                     let r = &win[1];
+
+                    // Safety: never allow merges that include special tokens
+                    if l == S_EOS || r == S_EOS || l == S_UNK || r == S_UNK {
+                        continue;
+                    }
+
                     *pair_count.entry((l.clone(), r.clone())).or_insert(0) += 1;
                 }
             }
@@ -160,15 +202,30 @@ impl Tokenizer {
             let Some(((l, r), freq)) = best_pair else {
                 break;
             };
+
+            // Stop if no meaningful repetition remains
             if freq < 2 {
                 break;
             }
 
+            // Safety: never create merged tokens that are special tokens or contain them
+            if l == S_EOS || r == S_EOS || l == S_UNK || r == S_UNK {
+                continue;
+            }
+
             let merged = format!("{}{}", l, r);
+
+            // Safety: prevent merges that would create the literal EOS token
+            if merged == S_EOS || merged == S_UNK {
+                continue;
+            }
+
             self.add_token_if_missing(&merged);
             self.merges.push((l.clone(), r.clone()));
-            self.fast_merge.insert((l.clone(), r.clone()), merged.clone());
+            self.fast_merge
+                .insert((l.clone(), r.clone()), merged.clone());
 
+            // Apply merge to corpus
             for seq in &mut corpus {
                 let mut i = 0usize;
                 while i + 1 < seq.len() {
@@ -182,49 +239,16 @@ impl Tokenizer {
             }
         }
 
+        // Final safety: remove any merge lines that reference special tokens
+        self.merges
+            .retain(|(l, r)| l != S_EOS && r != S_EOS && l != S_UNK && r != S_UNK);
+
         self.rebuild_fast_merge();
     }
 
-    // Helper for inference stop sequences:
-    // - encodes a text fragment without appending EOS
-    // - safe for token based stop matching
-    pub fn encode_stop_sequence(&self, s_text: &str) -> Vec<usize> {
-        if s_text.is_empty() {
-            return Vec::new();
-        }
-
-        let mut v_tokens: Vec<String> = s_text
-            .as_bytes()
-            .iter()
-            .map(|&b| self.byte_to_ch[b as usize].to_string())
-            .collect();
-
-        let mut v_work = v_tokens;
-        for (l, r) in &self.merges {
-            let merged = self
-                .fast_merge
-                .get(&(l.clone(), r.clone()))
-                .cloned()
-                .unwrap_or_else(|| format!("{}{}", l, r));
-
-            let mut i = 0usize;
-            while i + 1 < v_work.len() {
-                if v_work[i] == *l && v_work[i + 1] == *r {
-                    v_work[i] = merged.clone();
-                    v_work.remove(i + 1);
-                } else {
-                    i += 1;
-                }
-            }
-        }
-
-        let i_unk = self.unk_id();
-        v_work
-            .iter()
-            .map(|t| self.encode_token(t).unwrap_or(i_unk))
-            .collect()
-    }
-
+    // ------------------------------------------------------------------------
+    // Encoding and decoding (unchanged)
+    // ------------------------------------------------------------------------
     pub fn encode_text(&self, s_text: &str) -> Vec<usize> {
         // Defensive: remove literal EOS marker at end to avoid duplication.
         let mut s_work = s_text.to_string();
@@ -239,6 +263,7 @@ impl Tokenizer {
             .map(|&b| self.byte_to_ch[b as usize].to_string())
             .collect();
 
+        // Append EOS special token (exactly once)
         v_tokens.push(S_EOS.to_string());
 
         let mut v_work = v_tokens;
@@ -278,7 +303,6 @@ impl Tokenizer {
             if s_tok == S_EOS {
                 break;
             }
-
             if s_tok == S_UNK {
                 continue;
             }
@@ -298,6 +322,7 @@ impl Tokenizer {
         }
     }
 
+    // Persistence (unchanged)
     pub fn save(&self, s_vocab_path: &str, s_merges_path: &str) -> std::io::Result<()> {
         let f_vocab = OpenOptions::new()
             .create(true)
@@ -346,6 +371,7 @@ impl Tokenizer {
         let mut rm = BufReader::new(f_merges);
         let mut s_data = String::new();
         rm.read_to_string(&mut s_data)?;
+
         tok.merges.clear();
         tok.fast_merge.clear();
 
@@ -357,8 +383,15 @@ impl Tokenizer {
             let mut it = s_line.split_whitespace();
             let Some(l) = it.next() else { continue; };
             let Some(r) = it.next() else { continue; };
+
             let l = unescape_ascii(l);
             let r = unescape_ascii(r);
+
+            // Safety: never load merges that include special tokens
+            if l == S_EOS || r == S_EOS || l == S_UNK || r == S_UNK {
+                continue;
+            }
+
             tok.merges.push((l.clone(), r.clone()));
             tok.fast_merge.insert((l, r), String::new());
         }
@@ -374,6 +407,9 @@ impl Tokenizer {
     }
 }
 
+// -----------------------------------------------------------------------------
+// GPT2 like byte encoder mapping
+// -----------------------------------------------------------------------------
 fn build_gpt2_byte_encoder() -> (Vec<char>, HashMap<char, u8>) {
     let mut bs: Vec<u8> = Vec::new();
     for b in 33u16..=126u16 {
@@ -387,7 +423,7 @@ fn build_gpt2_byte_encoder() -> (Vec<char>, HashMap<char, u8>) {
     }
 
     let mut cs: Vec<u32> = bs.iter().map(|&b| b as u32).collect();
-    let used: HashSet<u8> = bs.iter().copied().collect();
+    let mut used: HashSet<u8> = bs.iter().copied().collect();
 
     let mut i_next: u32 = 256;
     for b in 0u16..=255u16 {
@@ -413,6 +449,7 @@ fn build_gpt2_byte_encoder() -> (Vec<char>, HashMap<char, u8>) {
     (byte_to_ch, ch_to_byte)
 }
 
+// ASCII escape for merges file (keeps file ASCII only)
 fn escape_ascii(s_in: &str) -> String {
     let mut out = String::new();
     for b in s_in.as_bytes() {

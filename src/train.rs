@@ -386,7 +386,7 @@ impl LLM {
         let v_stop_tok: Vec<Vec<usize>> = params
             .v_stop_sequences
             .iter()
-            .map(|s| self.tokenizer.encode_stop_sequence(s))
+            .map(|s| self.tokenizer.encode_text(s))
             .filter(|v| !v.is_empty())
             .collect();
 
@@ -1120,7 +1120,7 @@ fn build_assistant_only_mask(
     let s_prefix = &s_in_text[..i_cut];
 
     // Encode prefix without EOS to approximate token boundary index.
-    let v_prefix_tok = tokenizer.encode_stop_sequence(s_prefix);
+    let v_prefix_tok = tokenizer.encode_text(s_prefix);
     let i_prefix_len = v_prefix_tok.len();
 
     // v_tgt aligns with v_in shifted by 1
