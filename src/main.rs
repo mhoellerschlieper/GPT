@@ -21,6 +21,7 @@ mod math;
 mod tokenize;
 mod train;
 mod utils;
+mod augmentation;
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -31,11 +32,12 @@ use std::collections::HashMap;
 
 use crate::utils::MAX_SEQ_LEN_CANONICAL;
 use layers::{Embeddings, OutputProjection, TransformerBlockV2};
-use tokenize::Tokenizer;
+use tokenize::{Tokenizer, S_EOS};
 use train::{InferenceGrid, LLM, TrainConfig};
 use utils::{
     DROPOUT, Dataset, DatasetType, EMBEDDING_DIM, HEADS, HIDDEN_DIM, LEARN_RATE_PRETRAIN, LEARN_RATE_TRAIN,
 };
+use crate::augmentation::{apply_textspace_jitter_non_deterministic, jitter_window_len_non_deterministic, AugmentationConfig};
 
 const S_CHECKPOINT_PATH: &str = "checkpoint.bin";
 const S_TOKENIZER_VOCAB_PATH: &str = "data/tokenizer_vocab.bin";
@@ -335,6 +337,10 @@ fn run_menu(mut llm: LLM, dataset: Dataset) -> io::Result<()> {
                     io::stdout().flush()?;
                     let s_q = read_line_trimmed()?;
                     if s_q.eq_ignore_ascii_case("done") {
+                        break;
+                    }
+
+                    if s_q.eq_ignore_ascii_case(S_EOS) {
                         break;
                     }
                     if s_q.is_empty() {

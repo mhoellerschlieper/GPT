@@ -21,6 +21,7 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
 
+use crate::augmentation::{apply_textspace_jitter_non_deterministic, jitter_window_len_non_deterministic, AugmentationConfig};
 use crate::layers::{Embeddings, Layer, OutputProjection, TransformerBlockV2};
 use crate::math::{clip_gradients, compute_gradients_step, cross_entropy_loss_step, softmax_stable, GradScaler};
 use crate::tokenize::Tokenizer;
@@ -92,6 +93,9 @@ pub struct TrainConfig {
 
     // Mixed precision style controls
     pub b_grad_scaling: bool,
+    
+    pub b_augmentation: bool,
+    pub augmentation_cfg: AugmentationConfig,
 }
 
 impl TrainConfig {
@@ -109,6 +113,9 @@ impl TrainConfig {
             d_residual_dropout: 0.0,
             d_stochastic_depth_p: 0.0,
             b_grad_scaling: true,
+
+            b_augmentation: true,
+            augmentation_cfg: AugmentationConfig::conservative_default(),
         }
     }
 
@@ -137,6 +144,8 @@ impl TrainConfig {
         self.d_attention_dropout = self.d_attention_dropout.clamp(0.0, 0.9);
         self.d_residual_dropout = self.d_residual_dropout.clamp(0.0, 0.9);
         self.d_stochastic_depth_p = self.d_stochastic_depth_p.clamp(0.0, 0.9);
+
+        self.augmentation_cfg.sanitize();
     }
 }
 
@@ -214,7 +223,7 @@ impl LLM {
             println!("");
         }
     }
-    
+
     pub fn set_eval_mode_no_dropout(&mut self) {
         self.set_train_mode(false);
     }
@@ -733,7 +742,12 @@ fn split_train_val(v_texts: &[String], d_val_ratio: f32) -> (Vec<String>, Vec<St
     (v_texts[..i_train].to_vec(), v_texts[i_train..].to_vec())
 }
 
-fn sample_random_window_pair(v_sequences: &[Vec<usize>], i_max_seq_len_requested: usize, i_min_window_len: usize) -> (Vec<usize>, Vec<usize>) {
+fn sample_random_window_pair(
+    v_sequences: &[Vec<usize>],
+    i_max_seq_len_requested: usize,
+    i_min_window_len: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    // existing unchanged function remains for validation and for non augmented paths
     use rand::Rng;
 
     if v_sequences.is_empty() {
@@ -757,6 +771,69 @@ fn sample_random_window_pair(v_sequences: &[Vec<usize>], i_max_seq_len_requested
     } else {
         rng.gen_range(i_min_len_eff..=i_max_len_eff)
     };
+
+    let i_start_max = v_seq.len().saturating_sub(i_win_len);
+    let i_start = if i_start_max == 0 { 0 } else { rng.gen_range(0..=i_start_max) };
+
+    let i_end = i_start + i_win_len;
+    if i_end > v_seq.len() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let v_window = &v_seq[i_start..i_end];
+    if v_window.len() < 2 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let v_in = v_window[..v_window.len() - 1].to_vec();
+    let v_tgt = v_window[1..].to_vec();
+    (v_in, v_tgt)
+}
+
+//  sample from raw texts with augmentation and window length jitter
+fn sample_random_window_pair_from_texts_aug(
+    tokenizer: &Tokenizer,
+    v_texts: &[String],
+    i_max_seq_len_requested: usize,
+    i_min_window_len: usize,
+    aug_cfg: &AugmentationConfig,
+) -> (Vec<usize>, Vec<usize>) {
+    use rand::Rng;
+
+    if v_texts.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut rng = rand::thread_rng();
+    let i_idx = rng.gen_range(0..v_texts.len());
+    let s_raw = &v_texts[i_idx];
+
+    // Apply textspace jitter (non deterministic) with hard exclusion rules.
+    let s_aug = apply_textspace_jitter_non_deterministic(s_raw, aug_cfg);
+
+    // Tokenize after augmentation to ensure the dataset is effectively modified online.
+    let v_seq = tokenizer.encode_text(&s_aug);
+    if v_seq.len() < 2 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let i_max_seq_len = i_max_seq_len_requested.min(MAX_SEQ_LEN_CANONICAL).max(2);
+    let i_max_len_eff = i_max_seq_len.min(v_seq.len());
+    let i_min_len_eff = i_min_window_len.clamp(2, i_max_len_eff);
+
+    // Base length sampling, then jitter around that value.
+    let i_base_len = if i_min_len_eff >= i_max_len_eff {
+        i_max_len_eff
+    } else {
+        rng.gen_range(i_min_len_eff..=i_max_len_eff)
+    };
+
+    let i_win_len = jitter_window_len_non_deterministic(
+        i_base_len,
+        i_min_len_eff,
+        i_max_len_eff,
+        aug_cfg.d_window_len_jitter,
+    );
 
     let i_start_max = v_seq.len().saturating_sub(i_win_len);
     let i_start = if i_start_max == 0 { 0 } else { rng.gen_range(0..=i_start_max) };
