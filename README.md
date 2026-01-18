@@ -145,7 +145,7 @@ Contact:
 
 For academic referencing, the following citation format is recommended:
 
-Schlieper, M. (2026). *ExpChat.ai LLM (Rust): Tokenizer, Transformer Training and Corpus Pipeline* (Version 0.1.0) [Software]. ExpChat.ai. https://github.com//
+Schlieper, M. (2026). *ExpChat.ai LLM (Rust): Tokenizer, Transformer Training and Corpus Pipeline* (Version 0.1.0) [Software]. ExpChat.ai. [https://github.com//](https://github.com/mhoellerschlieper/GPT)
 
 Note: The link should be updated accordingly in the repository.
 
@@ -204,5 +204,6 @@ Das Projekt adressiert zentrale Anwendungsbereiche im Mittelstand, insbesondere 
 
 ```bash
 cargo build --release
+
 
 
