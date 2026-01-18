@@ -1,4 +1,4 @@
-# ExpChat.ai LLM (Rust) &ndash; AI Chat Client for SMEs
+# LLM Large Language Model in Rust
 
 ## Overview
 
@@ -150,7 +150,7 @@ Schlieper, M. (2026). *ExpChat.ai LLM (Rust): Tokenizer, Transformer Training an
 Note: The link should be updated accordingly in the repository.
 
 
-# ExpChat.ai LLM (Rust) - KI Chat Client fuer den Mittelstand
+# LLM in Rust
 
 ## Uebersicht
 
@@ -204,6 +204,7 @@ Das Projekt adressiert zentrale Anwendungsbereiche im Mittelstand, insbesondere 
 
 ```bash
 cargo build --release
+
 
 
 
