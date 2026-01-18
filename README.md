@@ -1,4 +1,3 @@
-markdown
 # ExpChat.ai LLM (Rust) &ndash; AI Chat Client for SMEs
 
 ## Overview
@@ -205,4 +204,5 @@ Das Projekt adressiert zentrale Anwendungsbereiche im Mittelstand, insbesondere 
 
 ```bash
 cargo build --release
+
 
