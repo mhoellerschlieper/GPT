@@ -1,19 +1,17 @@
-// tokenize.rs
+// tokenize.rs (PATCH)
 // ============================================================================
 // Author:   Marcus Schlieper
 // Company:  ExpChat.ai
 // Contact:  mschlieper@ylook.de | Tel 49 2338 8748862 | Mobil 49 15115751864
 // Address:  Epscheider Str21 58339 Breckerfeld
-// Note:     Tokenizer implementation with reversible byte mapping and BPE.
-//           This module provides a robust byte level BPE tokenizer using a
-//           GPT2 like byte encoder mapping to printable unicode codepoints,
-//           enabling lossless text <-> bytes <-> tokens roundtrip.
+// Note:     Tokenizer with reversible byte mapping and BPE.
+//           Patch adds stop sequence tokenization helper for inference.
 // History:
-//  - 2026-01-16: Initial version for reversible byte mapping tokenizer and BPE,
-//                plus safer persistence and encode/decode semantics.
+//  - 2026-01-18: Adds encode_stop_sequence helper and guards duplicate EOS.
 // ============================================================================
 
 #![forbid(unsafe_code)]
+#![allow(warnings)]
 
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
@@ -33,18 +31,13 @@ pub struct Tokenizer {
     #[bincode(with_serde)]
     words: Vec<String>,
 
-    // BPE merges, applied in stored order
     merges: Vec<(String, String)>,
 
-    // Reversible byte encoder, GPT2 style
-    // byte_to_ch maps raw byte -> printable unicode char
-    // ch_to_byte maps printable unicode char -> raw byte
     #[bincode(with_serde)]
     byte_to_ch: Vec<char>,
     #[bincode(with_serde)]
     ch_to_byte: HashMap<char, u8>,
 
-    // Fast lookup for merges
     #[serde(skip)]
     #[bincode(with_serde)]
     fast_merge: HashMap<(String, String), String>,
@@ -58,7 +51,6 @@ impl Tokenizer {
         let mut decode: HashMap<usize, String> = HashMap::new();
         let mut words: Vec<String> = Vec::new();
 
-        // Base vocab: 256 "byte tokens" represented as printable unicode chars
         for i_b in 0u16..=255u16 {
             let b = i_b as u8;
             let ch = byte_to_ch[b as usize];
@@ -69,7 +61,6 @@ impl Tokenizer {
             decode.insert(i_id, s_tok);
         }
 
-        // Special tokens
         let i_unk = words.len();
         words.push(S_UNK.to_string());
         encode.insert(S_UNK.to_string(), i_unk);
@@ -132,11 +123,6 @@ impl Tokenizer {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // BPE training
-    // ------------------------------------------------------------------------
-    // This is a simple BPE implementation intended for experimentation.
-    // It trains merges on already byte-encoded token sequences.
     pub fn train_bpe(&mut self, v_texts: &[String], i_merge_limit: usize) {
         let mut corpus: Vec<Vec<String>> = v_texts
             .iter()
@@ -183,7 +169,6 @@ impl Tokenizer {
             self.merges.push((l.clone(), r.clone()));
             self.fast_merge.insert((l.clone(), r.clone()), merged.clone());
 
-            // Apply merge to corpus
             for seq in &mut corpus {
                 let mut i = 0usize;
                 while i + 1 < seq.len() {
@@ -200,13 +185,48 @@ impl Tokenizer {
         self.rebuild_fast_merge();
     }
 
-    // ------------------------------------------------------------------------
-    // Encoding and decoding
-    // ------------------------------------------------------------------------
+    // Helper for inference stop sequences:
+    // - encodes a text fragment without appending EOS
+    // - safe for token based stop matching
+    pub fn encode_stop_sequence(&self, s_text: &str) -> Vec<usize> {
+        if s_text.is_empty() {
+            return Vec::new();
+        }
+
+        let mut v_tokens: Vec<String> = s_text
+            .as_bytes()
+            .iter()
+            .map(|&b| self.byte_to_ch[b as usize].to_string())
+            .collect();
+
+        let mut v_work = v_tokens;
+        for (l, r) in &self.merges {
+            let merged = self
+                .fast_merge
+                .get(&(l.clone(), r.clone()))
+                .cloned()
+                .unwrap_or_else(|| format!("{}{}", l, r));
+
+            let mut i = 0usize;
+            while i + 1 < v_work.len() {
+                if v_work[i] == *l && v_work[i + 1] == *r {
+                    v_work[i] = merged.clone();
+                    v_work.remove(i + 1);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        let i_unk = self.unk_id();
+        v_work
+            .iter()
+            .map(|t| self.encode_token(t).unwrap_or(i_unk))
+            .collect()
+    }
+
     pub fn encode_text(&self, s_text: &str) -> Vec<usize> {
-        // FIX:
-        // If dataset strings already contain the literal EOS marker at the end,
-        // remove it to avoid: (bytes of "</s>") + (special EOS token id).
+        // Defensive: remove literal EOS marker at end to avoid duplication.
         let mut s_work = s_text.to_string();
         if s_work.ends_with(S_EOS) {
             let i_new_len = s_work.len().saturating_sub(S_EOS.len());
@@ -219,7 +239,6 @@ impl Tokenizer {
             .map(|&b| self.byte_to_ch[b as usize].to_string())
             .collect();
 
-        // Append EOS special token
         v_tokens.push(S_EOS.to_string());
 
         let mut v_work = v_tokens;
@@ -256,42 +275,30 @@ impl Tokenizer {
                 continue;
             };
 
-            // Stop on EOS
             if s_tok == S_EOS {
                 break;
             }
 
-            // Skip UNK in decoding
             if s_tok == S_UNK {
                 continue;
             }
 
-            // Token can represent multiple reversible byte-chars (merged)
-            // For each char, map back to original byte via ch_to_byte.
             for ch in s_tok.chars() {
                 if let Some(&b) = self.ch_to_byte.get(&ch) {
                     v_bytes.push(b);
                 } else {
-                    // If token contains non-byte chars (should not happen),
-                    // ignore to keep decoding safe and non-panicking.
                     continue;
                 }
             }
         }
 
-        // v_bytes should be valid UTF-8 if input text was UTF-8.
-        // Use from_utf8 to preserve strictness, fallback to lossless replacement.
         match String::from_utf8(v_bytes) {
             Ok(s) => s,
             Err(e) => String::from_utf8_lossy(e.as_bytes()).to_string(),
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Persistence
-    // ------------------------------------------------------------------------
     pub fn save(&self, s_vocab_path: &str, s_merges_path: &str) -> std::io::Result<()> {
-        // Save vocab and encoder maps as bincode
         let f_vocab = OpenOptions::new()
             .create(true)
             .write(true)
@@ -299,13 +306,11 @@ impl Tokenizer {
             .open(s_vocab_path)?;
         let mut w = BufWriter::with_capacity(8 * 1024 * 1024, f_vocab);
 
-        // Write a small header for format identification
         w.write_all(b"TOK1")?;
         bincode::encode_into_std_write(self, &mut w, bincode::config::standard())
             .map_err(|_e| std::io::Error::new(std::io::ErrorKind::InvalidData, "bincode encode"))?;
         w.flush()?;
 
-        // Save merges also as a text file for easier inspection
         let f_merges = OpenOptions::new()
             .create(true)
             .write(true)
@@ -314,7 +319,6 @@ impl Tokenizer {
         let mut wm = BufWriter::with_capacity(4 * 1024 * 1024, f_merges);
 
         for (l, r) in &self.merges {
-            // ASCII only merges file
             let line = format!("{} {}\n", escape_ascii(l), escape_ascii(r));
             wm.write_all(line.as_bytes())?;
         }
@@ -338,7 +342,6 @@ impl Tokenizer {
         let mut tok: Tokenizer = bincode::decode_from_std_read(&mut r, bincode::config::standard())
             .map_err(|_e| std::io::Error::new(std::io::ErrorKind::InvalidData, "bincode decode"))?;
 
-        // Reload merges from merges file (authoritative order)
         let f_merges = File::open(s_merges_path)?;
         let mut rm = BufReader::new(f_merges);
         let mut s_data = String::new();
@@ -364,9 +367,6 @@ impl Tokenizer {
         Ok(tok)
     }
 
-    // ------------------------------------------------------------------------
-    // Selftests
-    // ------------------------------------------------------------------------
     pub fn selftest_roundtrip(&self, s_text: &str) -> bool {
         let v_ids = self.encode_text(s_text);
         let s_back = self.decode_tokens(&v_ids);
@@ -374,18 +374,8 @@ impl Tokenizer {
     }
 }
 
-// -----------------------------------------------------------------------------
-// GPT2 like byte encoder mapping
-// -----------------------------------------------------------------------------
-// This mapping ensures:
-// - Every byte 0..255 maps to a printable unicode codepoint
-// - Reverse mapping exists
-// Approach:
-// - Use visible ASCII and Latin1 supplement first
-// - Assign remaining bytes to unicode points starting from 256 upward
 fn build_gpt2_byte_encoder() -> (Vec<char>, HashMap<char, u8>) {
     let mut bs: Vec<u8> = Vec::new();
-    // Visible ranges
     for b in 33u16..=126u16 {
         bs.push(b as u8);
     }
@@ -397,9 +387,8 @@ fn build_gpt2_byte_encoder() -> (Vec<char>, HashMap<char, u8>) {
     }
 
     let mut cs: Vec<u32> = bs.iter().map(|&b| b as u32).collect();
-    let mut used: HashSet<u8> = bs.iter().copied().collect();
+    let used: HashSet<u8> = bs.iter().copied().collect();
 
-    // Fill missing bytes with unicode starting at 256
     let mut i_next: u32 = 256;
     for b in 0u16..=255u16 {
         let bb = b as u8;
@@ -411,7 +400,6 @@ fn build_gpt2_byte_encoder() -> (Vec<char>, HashMap<char, u8>) {
         i_next += 1;
     }
 
-    // Build maps
     let mut byte_to_ch: Vec<char> = vec!['\0'; 256];
     let mut ch_to_byte: HashMap<char, u8> = HashMap::with_capacity(256);
 
@@ -425,7 +413,6 @@ fn build_gpt2_byte_encoder() -> (Vec<char>, HashMap<char, u8>) {
     (byte_to_ch, ch_to_byte)
 }
 
-// ASCII escape for merges file (keeps file ASCII only)
 fn escape_ascii(s_in: &str) -> String {
     let mut out = String::new();
     for b in s_in.as_bytes() {

@@ -1,10 +1,17 @@
 // utils.rs
 // ============================================================================
-// Autor:   Marcus Schlieper (ExpChat.ai)
-// Hinweis: Config, Tokenizer, Dataset-Lader, Sequenz-Chunking.
+// Author:   Marcus Schlieper
+// Company:  ExpChat.ai
+// Contact:  mschlieper@ylook.de | Tel 49 2338 8748862 | Mobil 49 15115751864
+// Address:  Epscheider Str21 58339 Breckerfeld
+// Note:     Config, dataset loading helpers, and canonical limits.
+//           This patch increases MAX_SEQ_LEN_CANONICAL to 512.
+// History:
+//  - 2026-01-18: Raises MAX_SEQ_LEN_CANONICAL to 512 for longer context.
 // ============================================================================
 
 #![forbid(unsafe_code)]
+#![allow(warnings)]
 
 use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
@@ -12,7 +19,7 @@ use std::{fs, path::Path};
 
 // ---------------- Config ----------------
 
-pub const MAX_SEQ_LEN_CANONICAL: usize = 256;
+pub const MAX_SEQ_LEN_CANONICAL: usize = 512;
 
 // Backward compatible alias: use only if other modules still reference MAX_SEQ_LEN.
 pub const MAX_SEQ_LEN: usize = MAX_SEQ_LEN_CANONICAL;
@@ -70,14 +77,9 @@ pub fn get_data_from_csv(path: String) -> Vec<String> {
         let record = result.expect("Fehler beim Lesen eines CSV Datensatzes");
         let mut s_line: String = record.iter().collect::<Vec<&str>>().join(",");
         s_line = s_line.trim_end().to_string();
-
-        // FIX:
-        // Do not append S_EOS to text. Tokenizer::encode_text always appends EOS
-        // as a special token id, and adding the literal string "</s>" here
-        // would cause it to be tokenized as normal bytes plus an extra EOS.
+        // Note: Do not append S_EOS to text, tokenizer appends EOS as special token.
         v_data.push(s_line);
     }
 
     v_data
 }
-

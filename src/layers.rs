@@ -174,17 +174,18 @@ impl Layer for Embeddings {
 pub struct RMSNorm {
     d_epsilon: f32,
     #[bincode(with_serde)]
-    m_weight: Array2<f32>, // [1, embed]
+    m_weight: Array2<f32>,
 
     #[serde(skip)]
     #[bincode(with_serde)]
     m_cached_input: Option<Array2<f32>>,
     #[serde(skip)]
     #[bincode(with_serde)]
-    m_cached_rms_inv: Option<Array2<f32>>, // [seq, 1]
+    m_cached_rms_inv: Option<Array2<f32>>,
 
+    // FIX: was private, train.rs needs access for set_weight_decay()
     #[bincode(with_serde)]
-    opt_w: AdamW,
+    pub opt_w: AdamW,
 }
 
 impl RMSNorm {
@@ -309,14 +310,16 @@ pub struct MultiHeadAttention {
     pub i_head_dim: usize,
 
     #[bincode(with_serde)]
-    pub w_qkv: Array2<f32>, // [embed, 3*embed]
+    pub w_qkv: Array2<f32>,
     #[bincode(with_serde)]
-    pub w_o: Array2<f32>, // [embed, embed]
+    pub w_o: Array2<f32>,
 
+    // FIX: was private, train.rs needs access for set_weight_decay()
     #[bincode(with_serde)]
-    opt_qkv: AdamW,
+    pub opt_qkv: AdamW,
+    // FIX: was private, train.rs needs access for set_weight_decay()
     #[bincode(with_serde)]
-    opt_o: AdamW,
+    pub opt_o: AdamW,
 
     #[serde(skip)]
     #[bincode(with_serde)]
@@ -615,17 +618,19 @@ impl Layer for MultiHeadAttention {
 #[derive(Serialize, Deserialize, Encode, Decode)]
 pub struct FeedForwardGeGLU {
     #[bincode(with_serde)]
-    pub w_in: Array2<f32>, // [embed, 2*hidden]
+    pub w_in: Array2<f32>,
     #[bincode(with_serde)]
-    pub w_out: Array2<f32>, // [hidden, embed]
+    pub w_out: Array2<f32>,
 
     pub f_dropout: f32,
     pub b_train_mode: bool,
 
+    // FIX: was private, train.rs needs access for set_weight_decay()
     #[bincode(with_serde)]
-    opt_w_in: AdamW,
+    pub opt_w_in: AdamW,
+    // FIX: was private, train.rs needs access for set_weight_decay()
     #[bincode(with_serde)]
-    opt_w_out: AdamW,
+    pub opt_w_out: AdamW,
 
     #[serde(skip)]
     #[bincode(with_serde)]

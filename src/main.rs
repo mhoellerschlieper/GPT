@@ -5,39 +5,42 @@
 // Contact:  mschlieper@ylook.de | Tel 49 2338 8748862 | Mobil 49 15115751864
 // Address:  Epscheider Str21 58339 Breckerfeld
 // Note:     Entry point and CLI menu.
-//           Adds corpus menu entry to fetch/prepare/filter/pack datasets.
+//           Provides:
+//           - checkpoint load/save
+//           - two phase training flow
+//           - interactive inference and inference grid
+//           - corpus pipeline (fetch/prepare/filter/pack)
 // History:
 //  - 2026-01-16: Restores two phase training menu flow with Enter defaults.
 //  - 2026-01-17: Adds corpus menu entry for corpus pipeline execution.
-//  - 2026-01-17: Updates corpus menu defaults to a valid http source URL.
+//  - 2026-01-18: Fixes corpus menu compilation by using anyhow::Result and
+//                adding d_val_ratio_sources to CorpusPackSpec.
 // ============================================================================
 
 #![forbid(unsafe_code)]
 #![allow(warnings)]
 
+mod augmentation;
 mod corpus;
 mod layers;
 mod math;
 mod tokenize;
 mod train;
 mod utils;
-mod augmentation;
 
+use crate::corpus::{Corpus, CorpusPackSpec, CorpusSourceSpec, CorpusSpec};
+use crate::layers::{Embeddings, OutputProjection, TransformerBlockV2};
+use crate::tokenize::Tokenizer;
+use crate::train::{InferenceGrid, LLM, TrainConfig};
+use crate::utils::MAX_SEQ_LEN_CANONICAL;
+use anyhow::Context;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
-
-// NEW
-use crate::corpus::{Corpus, CorpusPackSpec, CorpusSourceSpec, CorpusSpec};
-use std::collections::HashMap;
-
-use crate::utils::MAX_SEQ_LEN_CANONICAL;
-use layers::{Embeddings, OutputProjection, TransformerBlockV2};
-use tokenize::{Tokenizer, S_EOS};
-use train::{InferenceGrid, LLM, TrainConfig};
 use utils::{
-    DROPOUT, Dataset, DatasetType, EMBEDDING_DIM, HEADS, HIDDEN_DIM, LEARN_RATE_PRETRAIN, LEARN_RATE_TRAIN,
+    Dataset, DatasetType, DROPOUT, EMBEDDING_DIM, HEADS, HIDDEN_DIM, LEARN_RATE_PRETRAIN,
+    LEARN_RATE_TRAIN,
 };
-use crate::augmentation::{apply_textspace_jitter_non_deterministic, jitter_window_len_non_deterministic, AugmentationConfig};
 
 const S_CHECKPOINT_PATH: &str = "checkpoint.bin";
 const S_TOKENIZER_VOCAB_PATH: &str = "data/tokenizer_vocab.bin";
@@ -90,7 +93,6 @@ fn read_f32_default(s_prompt: &str, d_default: f32, d_min: f32, d_max: f32) -> i
     }
 }
 
-// NEW
 fn read_string_default(s_prompt: &str, s_default: &str) -> io::Result<String> {
     loop {
         print!("{} [{}]: ", s_prompt, s_default);
@@ -107,25 +109,14 @@ fn read_string_default(s_prompt: &str, s_default: &str) -> io::Result<String> {
     }
 }
 
-// NEW
-fn run_corpus_menu() -> io::Result<()> {
-    // Note:
-    // - This routine is intentionally conservative. It builds datasets using corpus.rs pipeline.
-    // - The operator defines URLs. The pipeline persists raw/prepared/filtered/packed artifacts under root_dir/corpora/*.
-    //
-    // History:
-    //  - 2026-01-17: Adds interactive corpus load/build workflow in CLI.
-    //  - 2026-01-17: Updates defaults to a valid http(s) text file to prevent url validation failures.
-
+fn run_corpus_menu() -> anyhow::Result<()> {
     println!("===== CORPUS PIPELINE =====");
     println!("This builds datasets via: fetch, prepare, filter, pack");
     println!("Press Enter to accept defaults.");
 
-    // Root directory for corpora artifacts (default: data)
     let s_root_dir = read_string_default("corpus_root_dir", "data")?;
 
-    // Defaults MUST be a valid http(s) URL for s_kind "http_file".
-    // Chosen: Project Gutenberg plain text (stable public domain example).
+    // Defaults must be valid http(s) URL for kind http_file.
     let s_source_id = read_string_default("source_id", "gutenberg_shakespeare_100")?;
     let s_source_url = read_string_default(
         "source_url",
@@ -133,8 +124,9 @@ fn run_corpus_menu() -> io::Result<()> {
     )?;
     let s_source_filename = read_string_default("source_filename", "pg100.txt")?;
 
-    // Packing controls
     let d_pretrain_ratio = read_f32_default("pretrain_ratio", 0.20, 0.0, 1.0)?;
+    let d_val_ratio_sources = read_f32_default("val_ratio_sources", 0.10, 0.0, 0.5)?;
+
     let i_max_lines_total = read_usize_default("max_lines_total", 200000, 100, 100000000)?;
     let i_min_line_len = read_usize_default("min_line_len", 40, 1, 100000)?;
     let i_max_line_len = read_usize_default("max_line_len", 2000, 10, 200000)?;
@@ -159,20 +151,23 @@ fn run_corpus_menu() -> io::Result<()> {
             i_max_lines_total,
             i_min_line_len,
             i_max_line_len,
+            d_val_ratio_sources,
         },
     };
 
     println!("CORPUS: fetch");
-    let manifest = corpus.corpus_fetch(&spec)?;
+    let manifest = corpus.corpus_fetch(&spec).context("corpus_fetch failed")?;
 
     println!("CORPUS: prepare");
-    corpus.corpus_prepare(&spec, &manifest)?;
+    corpus
+        .corpus_prepare(&spec, &manifest)
+        .context("corpus_prepare failed")?;
 
     println!("CORPUS: filter");
-    corpus.corpus_filter(&spec)?;
+    corpus.corpus_filter(&spec).context("corpus_filter failed")?;
 
     println!("CORPUS: pack");
-    corpus.corpus_pack(&spec)?;
+    corpus.corpus_pack(&spec).context("corpus_pack failed")?;
 
     println!("CORPUS: done");
     Ok(())
@@ -250,6 +245,10 @@ fn default_cfg_pretrain() -> TrainConfig {
     cfg.d_lr = LEARN_RATE_PRETRAIN;
     cfg.i_max_seq_len = 256;
     cfg.i_min_window_len = 32;
+
+    // Pretraining should typically not use assistant-only masking.
+    cfg.b_loss_mask_assistant_only = false;
+
     cfg
 }
 
@@ -262,6 +261,10 @@ fn default_cfg_main() -> TrainConfig {
     cfg.d_lr = LEARN_RATE_TRAIN;
     cfg.i_max_seq_len = 256;
     cfg.i_min_window_len = 32;
+
+    // Main training (chat) can use assistant-only masking.
+    cfg.b_loss_mask_assistant_only = true;
+
     cfg
 }
 
@@ -276,14 +279,12 @@ fn menu_cfg_with_defaults(s_title: &str, cfg_in: &TrainConfig) -> io::Result<Tra
     cfg.i_batch_size = read_usize_default("batch_size", cfg.i_batch_size, 1, 1024)?;
     cfg.d_val_ratio = read_f32_default("val_ratio", cfg.d_val_ratio, 0.0, 0.5)?;
     cfg.d_lr = read_f32_default("learn_rate", cfg.d_lr, 1e-6, 1.0)?;
-    cfg.i_max_seq_len = read_usize_default("max_seq_len", cfg.i_max_seq_len, 32, 2048)?;
-    cfg.i_min_window_len = read_usize_default("min_window_len", cfg.i_min_window_len, 8, 2048)?;
+    cfg.i_max_seq_len = read_usize_default("max_seq_len", cfg.i_max_seq_len, 32, MAX_SEQ_LEN_CANONICAL)?;
+    cfg.i_min_window_len = read_usize_default("min_window_len", cfg.i_min_window_len, 8, MAX_SEQ_LEN_CANONICAL)?;
 
     if cfg.i_min_window_len > cfg.i_max_seq_len {
         cfg.i_min_window_len = cfg.i_max_seq_len;
     }
-
-    cfg.i_max_seq_len = read_usize_default("max_seq_len", 256, 32, MAX_SEQ_LEN_CANONICAL)?;
 
     Ok(cfg)
 }
@@ -339,8 +340,9 @@ fn run_menu(mut llm: LLM, dataset: Dataset) -> io::Result<()> {
                     if s_q.eq_ignore_ascii_case("done") {
                         break;
                     }
-
-                    
+                    if s_q.is_empty() {
+                        continue;
+                    }
                     let s_prompt = format!("User: {} Assistant: ", s_q);
                     print!("assistant> ");
                     io::stdout().flush()?;
