@@ -204,8 +204,16 @@ impl Tokenizer {
     // Encoding and decoding
     // ------------------------------------------------------------------------
     pub fn encode_text(&self, s_text: &str) -> Vec<usize> {
-        // Convert input bytes to reversible unicode byte tokens first
-        let mut v_tokens: Vec<String> = s_text
+        // FIX:
+        // If dataset strings already contain the literal EOS marker at the end,
+        // remove it to avoid: (bytes of "</s>") + (special EOS token id).
+        let mut s_work = s_text.to_string();
+        if s_work.ends_with(S_EOS) {
+            let i_new_len = s_work.len().saturating_sub(S_EOS.len());
+            s_work.truncate(i_new_len);
+        }
+
+        let mut v_tokens: Vec<String> = s_work
             .as_bytes()
             .iter()
             .map(|&b| self.byte_to_ch[b as usize].to_string())
@@ -214,7 +222,6 @@ impl Tokenizer {
         // Append EOS special token
         v_tokens.push(S_EOS.to_string());
 
-        // Apply merges in training order
         let mut v_work = v_tokens;
         for (l, r) in &self.merges {
             let merged = self

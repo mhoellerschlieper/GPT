@@ -60,19 +60,21 @@ fn get_data_from_json(path: String) -> Vec<String> {
 pub fn get_data_from_csv(path: String) -> Vec<String> {
     let file_path = Path::new(&path);
     let file = fs::File::open(file_path)
-        .unwrap_or_else(|e| panic!("CSV-Datei {:?} konnte nicht geoeffnet werden: {}", file_path, e));
+        .unwrap_or_else(|e| panic!("CSV Datei {:?} konnte nicht geoeffnet werden: {}", file_path, e));
 
     let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(file);
 
     let mut v_data: Vec<String> = Vec::new();
 
     for (_i, result) in rdr.records().enumerate() {
-        let record = result.expect("Fehler beim Lesen eines CSV-Datensatzes");
+        let record = result.expect("Fehler beim Lesen eines CSV Datensatzes");
         let mut s_line: String = record.iter().collect::<Vec<&str>>().join(",");
         s_line = s_line.trim_end().to_string();
-        if !s_line.ends_with(S_EOS) {
-            s_line.push_str(S_EOS);
-        }
+
+        // FIX:
+        // Do not append S_EOS to text. Tokenizer::encode_text always appends EOS
+        // as a special token id, and adding the literal string "</s>" here
+        // would cause it to be tokenized as normal bytes plus an extra EOS.
         v_data.push(s_line);
     }
 

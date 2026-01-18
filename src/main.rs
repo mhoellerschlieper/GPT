@@ -340,12 +340,7 @@ fn run_menu(mut llm: LLM, dataset: Dataset) -> io::Result<()> {
                         break;
                     }
 
-                    if s_q.eq_ignore_ascii_case(S_EOS) {
-                        break;
-                    }
-                    if s_q.is_empty() {
-                        continue;
-                    }
+                    
                     let s_prompt = format!("User: {} Assistant: ", s_q);
                     print!("assistant> ");
                     io::stdout().flush()?;
